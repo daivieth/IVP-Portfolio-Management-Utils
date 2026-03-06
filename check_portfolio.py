@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from jinja2 import Template
 import os
+import webbrowser # Import the webbrowser module
 from datetime import datetime, timedelta
 
 
@@ -192,20 +193,20 @@ def calculate_risk_contribution(pos_values, total_ts):
 # CHARTS
 # =============================================================================
 
-def generate_charts(ts_data, risk_contrib, corr_matrix):
+def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
 
     charts = {}
     fig = go.Figure()
-    fig.update_layout(height=400)
+    fig.update_layout(height=600)
     fig.add_trace(go.Scatter(x=ts_data["total"].index, y=ts_data["total"], name="Portfolio"))
     if not ts_data["benchmark"].empty:
-        fig.add_trace(go.Scatter(x=ts_data["benchmark"].index, y=ts_data["benchmark"], name="Benchmark"))
+        fig.add_trace(go.Scatter(x=ts_data["benchmark"].index, y=ts_data["benchmark"], name=f"Benchmark ({benchmark_ticker})"))
 
     charts["value"] = fig.to_html(full_html=False)
     weights = risk_contrib["Weight"]
-    pie = px.pie(values=weights, names=weights.index, height=450)
+    pie = px.pie(values=weights, names=weights.index, height=550)
     charts["allocation"] = pie.to_html(full_html=False)
-    heat = px.imshow(corr_matrix, height=450)
+    heat = px.imshow(corr_matrix, height=550)
     charts["corr"] = heat.to_html(full_html=False)
 
     return charts
@@ -215,7 +216,7 @@ def generate_charts(ts_data, risk_contrib, corr_matrix):
 # HTML REPORT
 # =============================================================================
 
-def generate_html_report(metrics, charts):
+def generate_html_report(metrics, charts, report_title):
 
     template = Template("""
 
@@ -301,9 +302,9 @@ def generate_html_report(metrics, charts):
 
     <body>
 
-    <h1>Portfolio Analytics</h1>
+    <h1>{{ report_title }}</h1>
 
-    <h2>Portfolio Value</h2>
+    <h2>Portfolio 5-Year Backtest</h2>
     <div class="chart-container">
         {{ charts.value | safe }}
     </div>
@@ -325,7 +326,7 @@ def generate_html_report(metrics, charts):
                         {% for metric, value in data.items() %}
                         <tr>
                             <td>{{ metric }}</td>
-                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown"] %}
+                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
                                 <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
                             {% else %}
                                 <td>{{ "%.4f" | format(value) if value is number else value }}</td>
@@ -359,7 +360,7 @@ def generate_html_report(metrics, charts):
 
     """)
 
-    html = template.render(metrics=metrics, charts=charts)
+    html = template.render(metrics=metrics, charts=charts, report_title=report_title)
 
     with open("portfolio_report.html","w") as f:
         f.write(html)
@@ -373,13 +374,19 @@ def generate_html_report(metrics, charts):
 
 def main():
 
+    report_title = input("Enter the portfolio report title: ")
     print("Starting portfolio analysis")
     portfolio = load_portfolio()
     tickers = portfolio["ticker"].unique().tolist()
 
-    if "A200.AX" not in tickers:
-        tickers.append("A200.AX")
-    if "^AXJO" not in tickers:
+    benchmark_ticker_input = input("Enter the benchmark ticker (default: A200.AX): ")
+    benchmark_ticker = benchmark_ticker_input if benchmark_ticker_input else "A200.AX"
+
+    # Ensure benchmark ticker and fallback are in the tickers list for download
+    if benchmark_ticker not in tickers:
+        tickers.append(benchmark_ticker)
+    # Always add ^AXJO as a fallback if it's not the primary benchmark and not already in tickers
+    if benchmark_ticker != "^AXJO" and "^AXJO" not in tickers:
         tickers.append("^AXJO")
 
     end = datetime.now()
@@ -387,15 +394,18 @@ def main():
 
     prices = download_price_data(tickers, start, end)
 
-    # Ensure benchmark ticker is in the downloaded prices
-    benchmark_ticker = "A200.AX"
+    # Final check and potential fallback for benchmark ticker from downloaded data
     if benchmark_ticker not in prices.columns:
-        # Fallback to ^AXJO if A200.AX is not found
         if "^AXJO" in prices.columns:
-            print(f"Warning: {benchmark_ticker} not found, falling back to ^AXJO as benchmark.")
+            print(f"Warning: Primary benchmark {benchmark_ticker} not found, falling back to ^AXJO as benchmark.")
             benchmark_ticker = "^AXJO"
         else:
             raise ValueError(f"Benchmark ticker {benchmark_ticker} (and fallback ^AXJO) not found in downloaded data. Available columns: {prices.columns.tolist()}")
+
+    # If the chosen benchmark is in prices, but was not in the original tickers list,
+    # it means it was added implicitly or as fallback. Ensure it's not duplicate added logic.
+    # The benchmark_ticker is now confirmed to be in prices.columns
+
 
     ts = build_portfolio_timeseries(prices, portfolio)
     returns = calculate_returns(ts)
@@ -417,10 +427,16 @@ def main():
 
     for layer in ["defensive","active","total"]:
 
-        metrics[layer] = calculate_performance_metrics(
-            returns[layer],
+        layer_returns = returns[layer]
+        performance_metrics = calculate_performance_metrics(
+            layer_returns,
             benchmark
         )
+        var_cvar = calculate_var_cvar(layer_returns)
+        performance_metrics["VaR"] = var_cvar["VaR"]
+        performance_metrics["CVaR"] = var_cvar["CVaR"]
+        metrics[layer] = performance_metrics
+
 
     risk = calculate_risk_contribution(ts["positions"], ts["total"])
 
@@ -428,11 +444,15 @@ def main():
 
     corr = pos_returns.corr()
 
-    charts = generate_charts(ts, risk, corr)
+    charts = generate_charts(ts, risk, corr, benchmark_ticker)
 
-    generate_html_report(metrics, charts)
+    generate_html_report(metrics, charts, report_title)
 
     print("Analysis complete")
+
+    # Open the generated HTML report in a web browser
+    report_path = os.path.abspath("portfolio_report.html")
+    webbrowser.open(f"file://{report_path}")
 
 
 # =============================================================================
