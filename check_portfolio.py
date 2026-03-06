@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from scipy import stats
+from scipy.stats import norm
 import plotly.graph_objects as go
 import plotly.express as px
 from jinja2 import Template
@@ -280,7 +281,7 @@ def calculate_var_cvar(returns, confidence=0.95):
 
     Args:
         returns (pd.Series): A pandas Series of daily returns.
-        confidence (float): The confidence level for VaR and CVaR calculation (e.g., 0.95 for 95%).
+        confidence (float): The confidence level for VaR and CVaR calculation (e.9., 0.95 for 95%).
 
     Returns:
         dict: A dictionary containing:
@@ -296,6 +297,53 @@ def calculate_var_cvar(returns, confidence=0.95):
     cvar = returns[returns <= var].mean()
 
     return {"VaR": var, "CVaR": cvar}
+
+
+# =============================================================================
+# MONTE CARLO SIMULATION
+# =============================================================================
+
+def run_monte_carlo_simulation(initial_value, returns_series, num_simulations=10000, forecast_days=252):
+    """
+    Runs a Monte Carlo simulation to forecast future portfolio values.
+
+    Args:
+        initial_value (float): The starting value of the portfolio for the simulation.
+        returns_series (pd.Series): Historical daily returns of the portfolio.
+        num_simulations (int): The number of simulation paths to generate.
+        forecast_days (int): The number of trading days to forecast into the future.
+
+    Returns:
+        pd.DataFrame: A DataFrame where each column represents a single simulation path
+                      of cumulative portfolio values.
+    """
+    # Calculate daily drift and volatility from historical returns
+    # Drift represents the average daily return
+    drift = returns_series.mean()
+    # Volatility represents the standard deviation of daily returns
+    volatility = returns_series.std()
+
+    # Generate random daily returns for each simulation path
+    # The formula used here is based on Geometric Brownian Motion:
+    # daily_returns = exp(drift - 0.5 * volatility^2 + volatility * Z)
+    # where Z is a random variable from a standard normal distribution.
+    # We use norm.ppf to get the inverse of the cumulative distribution function
+    # for generating random numbers based on a normal distribution.
+    # np.random.rand generates uniform random numbers between 0 and 1.
+    random_shocks = norm.ppf(np.random.rand(forecast_days, num_simulations))
+    daily_returns = np.exp(drift - 0.5 * volatility**2 + volatility * random_shocks)
+
+    # Initialize a DataFrame to store all simulation paths
+    simulation_df = pd.DataFrame(index=range(forecast_days + 1), columns=range(num_simulations))
+    simulation_df.iloc[0] = initial_value
+
+    # Generate each simulation path
+    for i in range(num_simulations):
+        # Calculate cumulative simulated values for the current path
+        # Each column represents a simulation path
+        simulation_df.iloc[1:, i] = initial_value * daily_returns[:, i].cumprod()
+
+    return simulation_df
 
 
 # =============================================================================
@@ -441,6 +489,63 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
     return charts
 
 
+def generate_monte_carlo_chart(mc_simulations): 
+    """
+    Generates an interactive Plotly chart showing a subset of Monte Carlo simulation paths
+    and the mean path, with Y-axis in percentage change from initial value.
+
+    Args:
+        mc_simulations (pd.DataFrame): DataFrame containing all Monte Carlo simulation paths.
+
+    Returns:
+        str: HTML string representing the generated Plotly chart.
+    """
+    fig = go.Figure()
+    fig.update_layout(title="Monte Carlo Simulation: Portfolio Future Paths (% Change)", height=600)
+
+    # Calculate percentage change from initial value for all paths
+    initial_value_per_path = mc_simulations.iloc[0] # This will be a Series if mc_simulations has multiple columns
+    # Perform element-wise division and then subtract 1 and multiply by 100
+    # Ensure that initial_value_per_path is correctly broadcasted or aligned
+    mc_simulations_pct = (mc_simulations.div(initial_value_per_path, axis=1) - 1) * 100
+
+    # Select a subset of significant paths for plotting
+    num_paths_to_plot = 1000
+    total_simulations = mc_simulations_pct.shape[1]
+
+    # Identify the best and worst performing paths based on their final percentage values
+    final_values_pct = mc_simulations_pct.iloc[-1]
+    best_path_idx = final_values_pct.idxmax()
+    worst_path_idx = final_values_pct.idxmin()
+
+    # Select a random sample of other paths
+    # Exclude best and worst path indices from random selection
+    other_paths_indices = [i for i in range(total_simulations) if i != best_path_idx and i != worst_path_idx]
+    
+    # Ensure we don't try to sample more than available, especially if total_simulations is small
+    num_random_to_select = max(0, min(num_paths_to_plot - 2, len(other_paths_indices)))
+    selected_other_indices = np.random.choice(other_paths_indices, num_random_to_select, replace=False)
+
+    # Combine selected indices, ensuring uniqueness and including best/worst
+    selected_indices = list(set([best_path_idx, worst_path_idx] + list(selected_other_indices)))
+
+    # Add selected simulation paths as thin, translucent lines
+    for i in selected_indices:
+        fig.add_trace(go.Scatter(x=mc_simulations_pct.index, y=mc_simulations_pct[i], mode='lines', name=None, showlegend=False, line=dict(color='rgba(31, 119, 180, 0.3)', width=1), opacity=0.3))
+
+    # Add specific traces for best and worst paths with clearer visibility
+    fig.add_trace(go.Scatter(x=mc_simulations_pct.index, y=mc_simulations_pct[best_path_idx], mode='lines', name='Best Path (% Change)', line=dict(color='green', width=1.5)))
+    fig.add_trace(go.Scatter(x=mc_simulations_pct.index, y=mc_simulations_pct[worst_path_idx], mode='lines', name='Worst Path (% Change)', line=dict(color='red', width=1.5)))
+
+    # Calculate and add the mean path
+    mean_path_pct = mc_simulations_pct.mean(axis=1)
+    fig.add_trace(go.Scatter(x=mean_path_pct.index, y=mean_path_pct, mode='lines', name='Mean Path (% Change)', line=dict(color='darkblue', width=2, dash='dash')))
+
+    fig.update_layout(xaxis_title='Days into Future', yaxis_title='Portfolio Value (% Change)', yaxis_tickformat=".0f%")
+
+    return fig.to_html(full_html=False)
+
+
 # =============================================================================
 # HTML REPORT
 # =============================================================================
@@ -462,145 +567,192 @@ def generate_html_report(metrics, charts, report_title):
         None: The function writes the HTML report to "portfolio_report.html".
     """
     template = Template("""
-    <html>
+<html>
 
-    <head>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px 5%;
-            padding: 0;
-            background-color: #f4f4f4;
-            color: #333;
-        }
-        h1 {
-            color: #2c3e50;
-            border-bottom: 2px solid #3498db;
-            padding-bottom: 10px;
-            margin-bottom: 20px;
-        }
-        h2 {
-            color: #34495e;
-            margin-top: 30px;
-            margin-bottom: 15px;
-        }
-        h3 {
-            color: #34495e;
-            margin-top: 20px;
-            margin-bottom: 10px;
-        }
-        pre {
-            background-color: #ecf0f1;
-            border: 1px solid #bdc3c7;
-            padding: 15px;
-            border-radius: 5px;
-            overflow-x: auto;
-        }
-        .chart-container {
-            margin-bottom: 30px;
-            padding: 20px;
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }
-        th, td {
-            border: 1px solid #ddd;
-            padding: 8px;
-            text-align: left;
-        }
-        th {
-            background-color: #f2f2f2;
-            color: #555;
-        }
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-    .side-by-side-container {
-        display: flex;
-        flex-wrap: wrap; /* Allows items to wrap to the next line on smaller screens */
-        gap: 20px; /* Space between the items */
+<head>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 20px 5%;
+        padding: 0;
+        background-color: #f4f4f4;
+        color: #333;
+    }
+    h1 {
+        color: #2c3e50;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 10px;
+        margin-bottom: 20px;
+    }
+    h2 {
+        color: #34495e;
+        margin-top: 30px;
+        margin-bottom: 15px;
+    }
+    h3 {
+        color: #34495e;
+        margin-top: 20px;
+        margin-bottom: 10px;
+    }
+    pre {
+        background-color: #ecf0f1;
+        border: 1px solid #bdc3c7;
+        padding: 15px;
+        border-radius: 5px;
+        overflow-x: auto;
+    }
+    .chart-container {
         margin-bottom: 30px;
+        padding: 20px;
+        background-color: #fff;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
     }
-    .side-by-side-container > div {
-        flex: 1; /* Each child div takes equal space */
-        min-width: 300px; /* Minimum width before wrapping */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
     }
-    .charts-column {
-        display: flex;
-        flex-direction: column;
-        justify-content: space-around; /* Distribute space evenly */
+    th, td {
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
     }
-    .charts-column .chart-container {
-        flex: 1; /* Make charts grow to fill vertical space */
+    th {
+        background-color: #f2f2f2;
+        color: #555;
     }
-    </style>
-    <title>Portfolio Report</title>
-    </head>
+    tr:nth-child(even) {
+        background-color: #f9f9f9;
+    }
+.side-by-side-container {
+    display: flex;
+    flex-wrap: wrap; /* Allows items to wrap to the next line on smaller screens */
+    gap: 20px; /* Space between the items */
+    margin-bottom: 30px;
+}
+.side-by-side-container > div {
+    flex: 1; /* Each child div takes equal space */
+    min-width: 300px; /* Minimum width before wrapping */
+}
+.charts-column {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around; /* Distribute space evenly */
+}
+.charts-column .chart-container {
+    flex: 1; /* Make charts grow to fill vertical space */
+}
+</style>
+<title>Portfolio Report</title>
+</head>
 
-    <body>
+<body>
 
-    <h1>{{ report_title }}</h1>
+<h1>{{ report_title }}</h1>
 
-    <h2>Portfolio 5-Year Backtest</h2>
-    <div class="chart-container">
-        {{ charts.value | safe }}
-    </div>
+<h2>Portfolio 5-Year Backtest</h2>
+<div class="chart-container">
+    {{ charts.value | safe }}
+</div>
 
-    <div class="side-by-side-container">
-        <div class="metrics-column">
-            <h2>Metrics</h2>
-            <div class="chart-container">
-                {% for layer, data in metrics.items() %}
-                <h3>{{ layer | title }} Component Metrics</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Metric</th>
-                            <th>Value</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for metric, value in data.items() %}
-                        <tr>
-                            <td>{{ metric }}</td>
-                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
-                                <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
-                            {% else %}
-                                <td>{{ "%.4f" | format(value) if value is number else value }}</td>
-                            {% endif %}
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-                {% endfor %}
-            </div>
-        </div>
+<div class="side-by-side-container">
+    <div class="metrics-column">
+        <h2>Metrics</h2>
+        <div class="chart-container">
+            {% for layer, data in metrics.items() %}
+            <h3>{{ layer | title }} Component Metrics</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for metric, value in data.items() %}
+                    {% if not (layer == 'total' and metric in ['MC_Expected_Drawdown_Pct', 'MC_VaR_99_Pct', 'MC_VaR_95_Pct', 'MC_Expected_Upside_95_Pct']) %}
+                    <tr>
+                        <td>{{ metric }}</td>
+                        {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
+                            <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
+                        {% else %}
+                            <td>{{ "%.4f" | format(value) if value is number else value }}</td>
+                        {% endif %}
+                    </tr>
+                    {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% endfor %}
+         </div>
+     </div>
 
-        <div class="charts-column">
-            <h2>Allocation</h2>
-            <div class="chart-container">
-                {{ charts.allocation | safe }}
-            </div>
+     <div class="charts-column">
+         <h2>Allocation</h2>
+         <div class="chart-container">
+             {{ charts.allocation | safe }}
+         </div>
 
-            <h2>Correlation</h2>
-            <div class="chart-container">
-                {{ charts.corr | safe }}
-            </div>
-        </div>
-    </div>
+         <h2>Correlation</h2>
+         <div class="chart-container">
+             {{ charts.corr | safe }}
+         </div>
+     </div>
+ </div>
+
+<div class="chart-container">
+     <h2>Monte Carlo Simulation Results (Total Portfolio)</h2>
+     <table>
+         <thead>
+             <tr>
+                 <th>Metric</th>
+                 <th>Value</th>
+             </tr>
+         </thead>
+         <tbody>
+             {% if metrics["total"]["MC_Expected_Drawdown_Pct"] is defined %}
+             <tr>
+                 <td>Forward Expected Drawdown</td>
+                 <td>{{ "%.2f%%" | format(metrics["total"]["MC_Expected_Drawdown_Pct"] * 100) if metrics["total"]["MC_Expected_Drawdown_Pct"] is number else "N/A" }}</td>
+             </tr>
+             {% endif %}
+             {% if metrics["total"]["MC_VaR_99_Pct"] is defined %}
+             <tr>
+                 <td>99% VaR (1-Year)</td>
+                 <td>{{ "%.2f%%" | format(metrics["total"]["MC_VaR_99_Pct"] * 100) if metrics["total"]["MC_VaR_99_Pct"] is number else "N/A" }}</td>
+             </tr>
+             {% endif %}
+             {% if metrics["total"]["MC_VaR_95_Pct"] is defined %}
+             <tr>
+                 <td>95% VaR (1-Year) Percent</td>
+                 <td>{{ "%.2f%%" | format(metrics["total"]["MC_VaR_95_Pct"] * 100) if metrics["total"]["MC_VaR_95_Pct"] is number else "N/A" }}</td>
+             </tr>
+             {% endif %}
+             {% if metrics["total"]["MC_Expected_Upside_95_Pct"] is defined %}
+             <tr>
+                 <td>95% Expected Upside (1-Year)</td>
+                 <td>{{ "%.2f%%" | format(metrics["total"]["MC_Expected_Upside_95_Pct"] * 100) if metrics["total"]["MC_Expected_Upside_95_Pct"] is number else "N/A" }}</td>
+             </tr>
+             {% endif %}
+         </tbody>
+     </table>
+ </div>
+
+{% if charts["monte_carlo"] is defined %}
+<div class="chart-container">
+    <h2>Monte Carlo Simulation Paths</h2>
+    {{ charts.monte_carlo | safe }}
+</div>
+{% endif %}
 
 
 
-    </body>
+</body>
 
-    </html>
+</html>
 
-    """)
+""")
 
     # Render the template with the provided metrics, charts, and title
     html = template.render(metrics=metrics, charts=charts, report_title=report_title)
@@ -705,6 +857,42 @@ def main():
         performance_metrics["CVaR"] = var_cvar["CVaR"]
         metrics[layer] = performance_metrics
 
+    # Monte Carlo Simulation
+    print("Running Monte Carlo Simulation (10,000 paths, 1-year forecast)...")
+    initial_portfolio_value = ts["total"].iloc[-1] # Last known total portfolio value
+    # Use total portfolio returns for simulation
+    mc_simulations = run_monte_carlo_simulation(initial_portfolio_value, returns["total"], num_simulations=10000, forecast_days=252)
+
+    # Calculate statistics from Monte Carlo simulation results
+    final_mc_values = mc_simulations.iloc[-1]
+    mc_mean = final_mc_values.mean()
+    mc_median = final_mc_values.median()
+    mc_var_95 = np.percentile(final_mc_values, 5) # 5th percentile for 95% VaR
+    mc_cvar_95 = final_mc_values[final_mc_values <= mc_var_95].mean() # CVaR is the mean of the values less than or equal to VaR
+
+    # Calculate percentage returns for each simulation path from initial value
+    mc_returns_percentage = (mc_simulations.iloc[-1] / mc_simulations.iloc[0] - 1)
+
+    # Calculate Forward Expected Drawdown (average of max drawdowns across paths)
+    drawdowns = []
+    for col in mc_simulations.columns:
+        cumulative = mc_simulations[col]
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        drawdowns.append(drawdown.min()) # Max drawdown for this path
+    mc_expected_drawdown = np.mean(drawdowns) # Average of max drawdowns
+
+    # Calculate VaR (percentage loss)
+    mc_var_95_pct = np.percentile(mc_returns_percentage, 5) # 5th percentile of returns
+
+    # Calculate Expected Upside (percentage gain)
+    mc_expected_upside_95_pct = np.percentile(mc_returns_percentage, 95) # 95th percentile of returns
+
+    metrics["total"]["MC_Expected_Drawdown_Pct"] = mc_expected_drawdown
+    metrics["total"]["MC_VaR_99_Pct"] = np.percentile(mc_returns_percentage, 1)
+    metrics["total"]["MC_VaR_95_Pct"] = mc_var_95_pct
+    metrics["total"]["MC_Expected_Upside_95_Pct"] = mc_expected_upside_95_pct
+
     # Calculate risk contribution for individual positions
     risk = calculate_risk_contribution(ts["positions"], ts["total"])
 
@@ -718,6 +906,10 @@ def main():
 
     # Generate interactive charts
     charts = generate_charts(ts, risk, corr, benchmark_ticker)
+
+    # Generate Monte Carlo simulation chart
+    mc_chart_html = generate_monte_carlo_chart(mc_simulations)
+    charts["monte_carlo"] = mc_chart_html
 
     # Generate and save the HTML report
     generate_html_report(metrics, charts, report_title)
