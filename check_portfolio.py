@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 def load_portfolio(core_file='core_portfolio.xlsx', active_file='active_portfolio.xlsx'):
 
     core_df = pd.read_excel(core_file)
-    core_df['type'] = 'core'
+    core_df['type'] = 'defensive'
 
     active_df = pd.read_excel(active_file)
     active_df['type'] = 'active'
@@ -69,7 +69,7 @@ def build_portfolio_timeseries(price_data, portfolio_df):
             pos_values[ticker] = price_data[ticker] * row["quantity"]
 
     # Convert to list so we can safely filter columns
-    core_tickers = portfolio_df.loc[portfolio_df["type"] == "core", "ticker"].tolist()
+    core_tickers = portfolio_df.loc[portfolio_df["type"] == "defensive", "ticker"].tolist()
     active_tickers = portfolio_df.loc[portfolio_df["type"] == "active", "ticker"].tolist()
 
     # Keep only tickers that exist in downloaded price data
@@ -83,7 +83,7 @@ def build_portfolio_timeseries(price_data, portfolio_df):
     total_ts = pos_values.sum(axis=1)
 
     return {
-        "core": core_ts,
+        "defensive": core_ts,
         "active": active_ts,
         "total": total_ts,
         "positions": pos_values
@@ -113,48 +113,34 @@ def calculate_returns(timeseries_dict):
 def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_rate=0.02):
 
     daily_rf = (1 + risk_free_rate) ** (1/252) - 1
-
     cum_ret = (1 + returns_series).prod() - 1
-
     n_days = len(returns_series)
-
     ann_ret = (1 + cum_ret) ** (252/n_days) - 1
-
     vol = returns_series.std() * np.sqrt(252)
-
     sharpe = ((returns_series.mean() - daily_rf) / returns_series.std()) * np.sqrt(252)
-
     downside = returns_series[returns_series < 0]
-
     sortino = (ann_ret - risk_free_rate) / (downside.std() * np.sqrt(252))
-
     cumulative = (1 + returns_series).cumprod()
-
     peak = cumulative.cummax()
-
     drawdown = (cumulative - peak) / peak
-
     max_dd = drawdown.min()
-
     common = returns_series.index.intersection(benchmark_returns.index)
 
     if len(common) > 30:
-
         y = returns_series.loc[common]
         x = benchmark_returns.loc[common]
-
         slope, intercept, r, p, stderr = stats.linregress(x, y)
-
         beta = slope
-
         benchmark_ann = (1 + x.mean())**252 - 1
-
         alpha = ann_ret - (risk_free_rate + beta * (benchmark_ann - risk_free_rate))
+        excess_returns = returns_series.loc[common] - benchmark_returns.loc[common]
+        information_ratio = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else np.nan
 
     else:
 
         beta = np.nan
         alpha = np.nan
+        information_ratio = np.nan
 
     return {
         "Annualized Return": ann_ret,
@@ -164,7 +150,8 @@ def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_r
         "Sortino Ratio": sortino,
         "Max Drawdown": max_dd,
         "Beta": beta,
-        "Alpha": alpha
+        "Alpha": alpha,
+        "Information Ratio": information_ratio
     }
 
 
@@ -188,19 +175,12 @@ def calculate_var_cvar(returns, confidence=0.95):
 def calculate_risk_contribution(pos_values, total_ts):
 
     returns = pos_values.pct_change().dropna()
-
     weights = pos_values.iloc[-1] / total_ts.iloc[-1]
-
     cov = returns.cov() * 252
-
     port_vol = np.sqrt(weights.T @ cov @ weights)
-
     mcr = cov @ weights / port_vol
-
     ccr = weights * mcr
-
     pct = ccr / port_vol
-
     return pd.DataFrame({
         "Weight": weights,
         "Risk Contribution": ccr,
@@ -215,24 +195,17 @@ def calculate_risk_contribution(pos_values, total_ts):
 def generate_charts(ts_data, risk_contrib, corr_matrix):
 
     charts = {}
-
     fig = go.Figure()
-
+    fig.update_layout(height=400)
     fig.add_trace(go.Scatter(x=ts_data["total"].index, y=ts_data["total"], name="Portfolio"))
-
     if not ts_data["benchmark"].empty:
         fig.add_trace(go.Scatter(x=ts_data["benchmark"].index, y=ts_data["benchmark"], name="Benchmark"))
 
     charts["value"] = fig.to_html(full_html=False)
-
     weights = risk_contrib["Weight"]
-
-    pie = px.pie(values=weights, names=weights.index)
-
+    pie = px.pie(values=weights, names=weights.index, height=450)
     charts["allocation"] = pie.to_html(full_html=False)
-
-    heat = px.imshow(corr_matrix)
-
+    heat = px.imshow(corr_matrix, height=450)
     charts["corr"] = heat.to_html(full_html=False)
 
     return charts
@@ -252,7 +225,7 @@ def generate_html_report(metrics, charts):
     <style>
         body {
             font-family: Arial, sans-serif;
-            margin: 20px;
+            margin: 20px 5%;
             padding: 0;
             background-color: #f4f4f4;
             color: #333;
@@ -304,6 +277,24 @@ def generate_html_report(metrics, charts):
         tr:nth-child(even) {
             background-color: #f9f9f9;
         }
+    .side-by-side-container {
+        display: flex;
+        flex-wrap: wrap; /* Allows items to wrap to the next line on smaller screens */
+        gap: 20px; /* Space between the items */
+        margin-bottom: 30px;
+    }
+    .side-by-side-container > div {
+        flex: 1; /* Each child div takes equal space */
+        min-width: 300px; /* Minimum width before wrapping */
+    }
+    .charts-column {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-around; /* Distribute space evenly */
+    }
+    .charts-column .chart-container {
+        flex: 1; /* Make charts grow to fill vertical space */
+    }
     </style>
     <title>Portfolio Report</title>
     </head>
@@ -312,43 +303,55 @@ def generate_html_report(metrics, charts):
 
     <h1>Portfolio Analytics</h1>
 
-    <h2>Metrics</h2>
-    <div class="chart-container">
-        {% for layer, data in metrics.items() %}
-        <h3>{{ layer | title }} Portfolio Metrics</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Metric</th>
-                    <th>Value</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for metric, value in data.items() %}
-                <tr>
-                    <td>{{ metric }}</td>
-                    <td>{{ "%.4f" | format(value) if value is number else value }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% endfor %}
-    </div>
-
     <h2>Portfolio Value</h2>
     <div class="chart-container">
         {{ charts.value | safe }}
     </div>
 
-    <h2>Allocation</h2>
-    <div class="chart-container">
-        {{ charts.allocation | safe }}
+    <div class="side-by-side-container">
+        <div class="metrics-column">
+            <h2>Metrics</h2>
+            <div class="chart-container">
+                {% for layer, data in metrics.items() %}
+                <h3>{{ layer | title }} Component Metrics</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for metric, value in data.items() %}
+                        <tr>
+                            <td>{{ metric }}</td>
+                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown"] %}
+                                <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
+                            {% else %}
+                                <td>{{ "%.4f" | format(value) if value is number else value }}</td>
+                            {% endif %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="charts-column">
+            <h2>Allocation</h2>
+            <div class="chart-container">
+                {{ charts.allocation | safe }}
+            </div>
+
+            <h2>Correlation</h2>
+            <div class="chart-container">
+                {{ charts.corr | safe }}
+            </div>
+        </div>
     </div>
 
-    <h2>Correlation</h2>
-    <div class="chart-container">
-        {{ charts.corr | safe }}
-    </div>
+
 
     </body>
 
@@ -371,9 +374,7 @@ def generate_html_report(metrics, charts):
 def main():
 
     print("Starting portfolio analysis")
-
     portfolio = load_portfolio()
-
     tickers = portfolio["ticker"].unique().tolist()
 
     if "A200.AX" not in tickers:
@@ -382,7 +383,6 @@ def main():
         tickers.append("^AXJO")
 
     end = datetime.now()
-
     start = end - timedelta(days=5*365)
 
     prices = download_price_data(tickers, start, end)
@@ -398,9 +398,7 @@ def main():
             raise ValueError(f"Benchmark ticker {benchmark_ticker} (and fallback ^AXJO) not found in downloaded data. Available columns: {prices.columns.tolist()}")
 
     ts = build_portfolio_timeseries(prices, portfolio)
-
     returns = calculate_returns(ts)
-
     benchmark = prices[benchmark_ticker].pct_change().dropna()
 
     # Calculate cumulative benchmark value, normalized to start at the same point as the portfolio
@@ -417,7 +415,7 @@ def main():
 
     metrics = {}
 
-    for layer in ["core","active","total"]:
+    for layer in ["defensive","active","total"]:
 
         metrics[layer] = calculate_performance_metrics(
             returns[layer],
