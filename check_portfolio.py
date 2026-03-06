@@ -218,11 +218,10 @@ def generate_charts(ts_data, risk_contrib, corr_matrix):
 
     fig = go.Figure()
 
-    fig.add_trace(go.Scatter(x=ts_data["total"].index, y=ts_data["total"], name="Total"))
+    fig.add_trace(go.Scatter(x=ts_data["total"].index, y=ts_data["total"], name="Portfolio"))
 
-    fig.add_trace(go.Scatter(x=ts_data["core"].index, y=ts_data["core"], name="Core"))
-
-    fig.add_trace(go.Scatter(x=ts_data["active"].index, y=ts_data["active"], name="Active"))
+    if not ts_data["benchmark"].empty:
+        fig.add_trace(go.Scatter(x=ts_data["benchmark"].index, y=ts_data["benchmark"], name="Benchmark"))
 
     charts["value"] = fig.to_html(full_html=False)
 
@@ -377,8 +376,10 @@ def main():
 
     tickers = portfolio["ticker"].unique().tolist()
 
-    if "SPY" not in tickers:
-        tickers.append("SPY")
+    if "A200.AX" not in tickers:
+        tickers.append("A200.AX")
+    if "^AXJO" not in tickers:
+        tickers.append("^AXJO")
 
     end = datetime.now()
 
@@ -386,11 +387,33 @@ def main():
 
     prices = download_price_data(tickers, start, end)
 
+    # Ensure benchmark ticker is in the downloaded prices
+    benchmark_ticker = "A200.AX"
+    if benchmark_ticker not in prices.columns:
+        # Fallback to ^AXJO if A200.AX is not found
+        if "^AXJO" in prices.columns:
+            print(f"Warning: {benchmark_ticker} not found, falling back to ^AXJO as benchmark.")
+            benchmark_ticker = "^AXJO"
+        else:
+            raise ValueError(f"Benchmark ticker {benchmark_ticker} (and fallback ^AXJO) not found in downloaded data. Available columns: {prices.columns.tolist()}")
+
     ts = build_portfolio_timeseries(prices, portfolio)
 
     returns = calculate_returns(ts)
 
-    benchmark = prices["SPY"].pct_change().dropna()
+    benchmark = prices[benchmark_ticker].pct_change().dropna()
+
+    # Calculate cumulative benchmark value, normalized to start at the same point as the portfolio
+    # Ensure benchmark and total portfolio start at the same date for comparison
+    common_index = ts["total"].index.intersection(benchmark.index)
+    if not common_index.empty:
+        initial_total_value = ts["total"].loc[common_index[0]]
+        cumulative_benchmark_returns = (1 + benchmark.loc[common_index]).cumprod()
+        # Normalize benchmark to start at the same value as the total portfolio
+        ts["benchmark"] = cumulative_benchmark_returns * (initial_total_value / cumulative_benchmark_returns.iloc[0])
+    else:
+        print("Warning: No common dates between portfolio total and benchmark for charting.")
+        ts["benchmark"] = pd.Series(dtype='float64') # Empty series if no common index
 
     metrics = {}
 
