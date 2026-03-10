@@ -83,7 +83,7 @@ def download_price_data(tickers, start_date, end_date):
         tickers,
         start=start_date,
         end=end_date,
-        auto_adjust=True,  # Automatically adjust prices for splits and dividends
+        auto_adjust=False, # Use False to get both Close and Adj Close
         progress=False     # Do not display download progress bar
     )
 
@@ -95,10 +95,15 @@ def download_price_data(tickers, start_date, end_date):
     # or a single-level column index (single ticker).
     if isinstance(data.columns, pd.MultiIndex):
         # Extract 'Close' prices for multiple tickers
+        # Note: We specifically use 'Close' for capital gains calculation.
+        # Total return (including yield) is calculated separately.
         prices = data["Close"]
     else:
         # If only one ticker, 'data' itself contains the prices
-        prices = data
+        if "Close" in data.columns:
+            prices = data["Close"]
+        else:
+            prices = data
 
     # Check for tickers that have very little data (e.g., less than 1 month)
     # This identifies "young" tickers that might be truncating the whole dataset if we use dropna()
@@ -122,13 +127,13 @@ def download_price_data(tickers, start_date, end_date):
 
 def get_sector_industry_data(tickers):
     """
-    Fetches sector and industry information for a list of tickers using yfinance.
+    Fetches sector, industry and dividend yield information for a list of tickers using yfinance.
 
     Args:
         tickers (list): A list of ticker symbols.
 
     Returns:
-        pd.DataFrame: A DataFrame with tickers as index and 'sector', 'industry' as columns.
+        pd.DataFrame: A DataFrame with tickers as index and 'sector', 'industry', 'dividendYield' as columns.
     """
     data = []
     for ticker in tickers:
@@ -136,10 +141,23 @@ def get_sector_industry_data(tickers):
             info = yf.Ticker(ticker).info
             sector = info.get('sector', 'Unknown')
             industry = info.get('industry', 'Unknown')
-            data.append({'ticker': ticker, 'sector': sector, 'industry': industry})
+            div_yield = info.get('dividendYield', 0.0)
+            
+            # yfinance often returns dividendYield as a decimal (e.g. 0.05 for 5%)
+            # but sometimes it might be returned as a whole number.
+            # We standardize it as a decimal (0.01 = 1%).
+            if div_yield is None:
+                div_yield = 0.0
+            
+            # Heuristic check: if yield is > 1.0 (e.g. 5.0 for 5%), convert to decimal
+            # Most stocks don't have > 100% dividend yield.
+            if div_yield > 1.0:
+                div_yield = div_yield / 100.0
+
+            data.append({'ticker': ticker, 'sector': sector, 'industry': industry, 'dividendYield': div_yield})
         except Exception as e:
             print(f"Warning: Could not fetch info for {ticker}: {e}")
-            data.append({'ticker': ticker, 'sector': 'Unknown', 'industry': 'Unknown'})
+            data.append({'ticker': ticker, 'sector': 'Unknown', 'industry': 'Unknown', 'dividendYield': 0.0})
     
     return pd.DataFrame(data).set_index('ticker')
 
@@ -173,15 +191,22 @@ def build_portfolio_timeseries(price_data, portfolio_df):
         ticker = row["ticker"]
         # Only include tickers for which price data was successfully downloaded
         if ticker in price_data.columns:
-            # Fill forward missing prices to handle assets that started later or had gaps,
-            # but only AFTER their first valid price (inception).
-            # This ensures we don't have NaNs for the entire row just because one asset didn't exist yet.
-            ticker_prices = price_data[ticker].ffill()
-            pos_values[ticker] = ticker_prices * row["quantity"]
+            # We must NOT fill forward from the start of the dataframe index if the asset didn't exist yet.
+            # yf.download might return NaNs for the period before a stock was listed.
+            ticker_prices = price_data[ticker]
+            # Find the first non-NaN index (inception)
+            first_valid = ticker_prices.first_valid_index()
+            if first_valid is not None:
+                # Fill forward only from inception
+                prices_from_inception = ticker_prices.loc[first_valid:].ffill()
+                # Create a series for the full index, initialized with NaN, then update with prices from inception
+                full_ticker_prices = pd.Series(np.nan, index=price_data.index)
+                full_ticker_prices.update(prices_from_inception)
+                pos_values[ticker] = full_ticker_prices * row["quantity"]
 
     # For the portfolio calculation, we only consider dates where we have data.
-    # We fill NaNs with 0 for assets that haven't launched yet, so they don't contribute to total value,
-    # and they don't cause the entire row to be NaN.
+    # We fill NaNs with 0 ONLY for assets that haven't launched yet or have no data,
+    # so they don't contribute to total value but also don't cause the sum to be NaN.
     pos_values = pos_values.fillna(0)
 
     # Separate tickers into core (defensive) and active lists
@@ -237,7 +262,7 @@ def calculate_returns(timeseries_dict):
 # PERFORMANCE METRICS
 # =============================================================================
 
-def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_rate=0.02):
+def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_rate=0.02, annual_yield=0.0, benchmark_yield=0.0):
     """
     Calculates a suite of performance metrics for a given series of returns,
     including risk-adjusted returns and drawdown metrics.
@@ -246,6 +271,8 @@ def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_r
         returns_series (pd.Series): A pandas Series of daily returns for the portfolio or asset.
         benchmark_returns (pd.Series): A pandas Series of daily returns for the benchmark.
         risk_free_rate (float): The annual risk-free rate (default is 0.02, or 2%).
+        annual_yield (float): The annual yield (dividends/coupons) to be included in the performance.
+        benchmark_yield (float): The annual yield of the benchmark for a fair comparison.
 
     Returns:
         dict: A dictionary containing the calculated performance metrics:
@@ -256,26 +283,39 @@ def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_r
               - "Sortino Ratio" (float)
               - "Max Drawdown" (float)
               - "Beta" (float or NaN): Sensitivity to benchmark, NaN if insufficient common data.
-              - "Alpha" (float or NaN): Excess return relative to benchmark, NaN if insufficient common data.
-              - "Information Ratio" (float or NaN): Excess return per unit of tracking error, NaN if insufficient common data or zero tracking error.
+              - "Market Exposure Effect (Cum.)" (float or NaN): The total return derived solely from benchmark exposure (Beta).
+              - "Alpha (Risk-Adj) Annualized" (float or NaN): Jensen's Alpha per year.
+              - "Alpha (Risk-Adj) Cumulative" (float or NaN): Total excess return over the whole period due to alpha.
+              - "Outperformance Annualized" (float or NaN): Simple difference in annual returns.
+              - "Outperformance Cumulative" (float or NaN): Simple difference in total returns.
+              - "Information Ratio" (float or NaN): Excess return per unit of tracking error.
     """
+    # Adjust returns to include the annual yield
+    # Convert annual yield to daily yield
+    daily_yield = (1 + annual_yield) ** (1/252) - 1
+    adjusted_returns = returns_series + daily_yield
+
+    # Adjust benchmark returns for yield (Fair Comparison)
+    daily_b_yield = (1 + benchmark_yield) ** (1/252) - 1
+    adjusted_benchmark_returns = benchmark_returns + daily_b_yield
+
     # Convert annual risk-free rate to a daily rate
     daily_rf = (1 + risk_free_rate) ** (1/252) - 1
     # Calculate cumulative return
-    cum_ret = (1 + returns_series).prod() - 1
-    n_days = len(returns_series)
+    cum_ret = (1 + adjusted_returns).prod() - 1
+    n_days = len(adjusted_returns)
     # Calculate annualized return
     ann_ret = (1 + cum_ret) ** (252/n_days) - 1
     # Calculate annualized volatility
-    vol = returns_series.std() * np.sqrt(252)
+    vol = adjusted_returns.std() * np.sqrt(252)
     # Calculate Sharpe Ratio
-    sharpe = ((returns_series.mean() - daily_rf) / returns_series.std()) * np.sqrt(252)
+    sharpe = ((adjusted_returns.mean() - daily_rf) / adjusted_returns.std()) * np.sqrt(252)
     # Isolate downside returns for Sortino Ratio calculation
-    downside = returns_series[returns_series < 0]
+    downside = adjusted_returns[adjusted_returns < 0]
     # Calculate Sortino Ratio
     sortino = (ann_ret - risk_free_rate) / (downside.std() * np.sqrt(252))
     # Calculate cumulative product for drawdown
-    cumulative = (1 + returns_series).cumprod()
+    cumulative = (1 + adjusted_returns).cumprod()
     # Find the running maximum for drawdown calculation
     peak = cumulative.cummax()
     # Calculate drawdown
@@ -283,27 +323,48 @@ def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_r
     # Determine the maximum drawdown
     max_dd = drawdown.min()
     # Find common dates between portfolio and benchmark returns for relative metrics
-    common = returns_series.index.intersection(benchmark_returns.index)
+    common = adjusted_returns.index.intersection(benchmark_returns.index)
 
     # Calculate Beta, Alpha, and Information Ratio only if sufficient common data exists
     if len(common) > 30: # A reasonable threshold for statistical significance
-        y = returns_series.loc[common]
-        x = benchmark_returns.loc[common]
+        y = adjusted_returns.loc[common]
+        x = adjusted_benchmark_returns.loc[common]
         # Perform linear regression to get beta (slope)
         slope, intercept, r, p, stderr = stats.linregress(x, y)
         beta = slope
-        # Calculate annualized benchmark return
-        benchmark_ann = (1 + x.mean())**252 - 1
-        # Calculate Alpha (Jensen's Alpha)
-        alpha = ann_ret - (risk_free_rate + beta * (benchmark_ann - risk_free_rate))
+        # Calculate annualized benchmark return for the COMMON period (geometric)
+        benchmark_cum_common = (1 + x).prod() - 1
+        benchmark_ann_common = (1 + benchmark_cum_common)**(252/len(x)) - 1
+        
+        # Calculate portfolio annualized return for the SAME common period (geometric)
+        y_cum_common = (1 + y).prod() - 1
+        y_ann_common = (1 + y_cum_common)**(252/len(y)) - 1
+
+        # Calculate Annualized Jensen's Alpha
+        alpha_ann = y_ann_common - (risk_free_rate + beta * (benchmark_ann_common - risk_free_rate))
+        
+        # Calculate Market Exposure Effect (Beta-driven part of return)
+        # Market Effect = Beta * (Benchmark_Cum - RiskFree_Cum)
+        risk_free_cum = (1 + risk_free_rate)**(len(y)/252) - 1
+        market_effect_cum = beta * (benchmark_cum_common - risk_free_cum)
+
+        # Calculate Cumulative Jensen's Alpha
+        # Total_Cum = RiskFree_Cum + Market_Effect_Cum + Alpha_Cum
+        alpha_cum = y_cum_common - (risk_free_cum + market_effect_cum)
+        
+        # Simple Outperformance
+        outperformance_ann = y_ann_common - benchmark_ann_common
+        outperformance_cum = y_cum_common - benchmark_cum_common
+
         # Calculate excess returns relative to the benchmark
-        excess_returns = returns_series.loc[common] - benchmark_returns.loc[common]
+        excess_returns = y - x
         # Calculate Information Ratio, handle division by zero for standard deviation
         information_ratio = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else np.nan
     else:
         # If not enough common data, set benchmark-relative metrics to NaN
         beta = np.nan
         alpha = np.nan
+        outperformance = np.nan
         information_ratio = np.nan
 
     return {
@@ -314,7 +375,11 @@ def calculate_performance_metrics(returns_series, benchmark_returns, risk_free_r
         "Sortino Ratio": sortino,
         "Max Drawdown": max_dd,
         "Beta": beta,
-        "Alpha": alpha,
+        "Market Exposure Effect (Cum.)": market_effect_cum,
+        "Alpha (Risk-Adj) Annualized": alpha_ann,
+        "Alpha (Risk-Adj) Cumulative": alpha_cum,
+        "Outperformance Annualized": outperformance_ann,
+        "Outperformance Cumulative": outperformance_cum,
         "Information Ratio": information_ratio
     }
 
@@ -438,7 +503,7 @@ def calculate_risk_contribution(pos_values, total_ts):
 # CHARTS
 # =============================================================================
 
-def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
+def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker, annual_yield=0.0):
     """
     Generates interactive Plotly charts for portfolio performance, asset allocation,
     and correlation matrix.
@@ -450,6 +515,7 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
         risk_contrib (pd.DataFrame): DataFrame with risk contribution data, including "Weight" column.
         corr_matrix (pd.DataFrame): Correlation matrix of position returns.
         benchmark_ticker (str): Ticker symbol of the benchmark asset.
+        annual_yield (float): The annual yield to include in total return performance.
 
     Returns:
         dict: A dictionary where keys are chart identifiers and values are HTML strings
@@ -466,14 +532,27 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
     # are aligned to a common starting point. So we can use the first value of total for normalization.
     initial_reference_value = ts_data["total"].iloc[0]
 
-    # Add portfolio performance trace
-    performance_total = ((ts_data["total"] / initial_reference_value) - 1) * 100
-    fig.add_trace(go.Scatter(x=performance_total.index, y=performance_total, name="Portfolio % Performance", mode='lines'))
+    # Add portfolio performance trace (including yield)
+    daily_yield = (1 + annual_yield) ** (1/252) - 1
+    total_returns = ts_data["total"].pct_change().fillna(0)
+    adjusted_returns = total_returns + daily_yield
+    # Fix the first day (which was set to 0 but should be 0 + daily_yield if we want to be precise,
+    # but the very first day has no return. Let's keep first return as 0 but yield starts from day 2?)
+    # Actually, let's just use cumulative product of (1 + adjusted_returns)
+    performance_total_return = ((1 + adjusted_returns).cumprod() - 1) * 100
+    
+    fig.add_trace(go.Scatter(x=performance_total_return.index, y=performance_total_return, name="Portfolio % Total Return (inc. Yield)", mode='lines'))
 
-    # Add benchmark performance trace if available
+    # Add portfolio capital gain only trace for comparison (Solid Red)
+    # Important: We recalculate cumulative performance from returns to handle
+    # the changing denominator of a multi-asset portfolio correctly.
+    performance_cap_gain = ((1 + total_returns).cumprod() - 1) * 100
+    fig.add_trace(go.Scatter(x=performance_cap_gain.index, y=performance_cap_gain, name="Portfolio % Capital Gain", mode='lines', line=dict(color='red')))
+
+    # Add benchmark performance trace if available (Solid Black)
     if not ts_data["benchmark"].empty:
         performance_benchmark = ((ts_data["benchmark"] / initial_reference_value) - 1) * 100
-        fig.add_trace(go.Scatter(x=performance_benchmark.index, y=performance_benchmark, name=f"Benchmark ({benchmark_ticker}) % Performance", mode='lines'))
+        fig.add_trace(go.Scatter(x=performance_benchmark.index, y=performance_benchmark, name=f"Benchmark ({benchmark_ticker}) % Performance", mode='lines', line=dict(color='black')))
 
     # Format y-axis as percentage
     fig.update_layout(yaxis_tickformat=".0f%")
@@ -570,23 +649,35 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df):
             <tr>
                 <th>Sector / Industry</th>
                 <th>Weight (%)</th>
+                <th>Avg. Div Yield (%)</th>
             </tr>
         </thead>
         <tbody>
     """
     for sector, s_weight in sector_weights.items():
+        # Calculate weighted average dividend yield for the sector
+        sector_data = analysis_df[analysis_df['sector'] == sector]
+        # Re-normalize weights within the sector for yield calculation
+        sector_yield = (sector_data['dividendYield'] * sector_data['Weight']).sum() / s_weight if s_weight > 0 else 0
+        
         table_html += f"""
             <tr style="background-color: #eef7ff; font-weight: bold;">
                 <td>{sector}</td>
                 <td>{s_weight*100:.2f}%</td>
+                <td>{sector_yield*100:.2f}%</td>
             </tr>
         """
         s_industries = industry_weights[industry_weights['sector'] == sector]
         for _, row in s_industries.iterrows():
+            # Calculate weighted average dividend yield for the industry
+            industry_data = analysis_df[(analysis_df['sector'] == sector) & (analysis_df['industry'] == row['industry'])]
+            industry_yield = (industry_data['dividendYield'] * industry_data['Weight']).sum() / row['Weight'] if row['Weight'] > 0 else 0
+            
             table_html += f"""
                 <tr>
                     <td style="padding-left: 20px;">&bull; {row['industry']}</td>
                     <td>{row['Weight']*100:.2f}%</td>
+                    <td>{industry_yield*100:.2f}%</td>
                 </tr>
             """
     table_html += "</tbody></table>"
@@ -798,31 +889,31 @@ def generate_html_report(metrics, charts, report_title, inception_date):
                     <tr>
                         <td>{{ metric }}</td>
                         {# Portfolio Column #}
-                        {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
+                        {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR", "Estimated Yield"] %}
                             <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
-                        {% elif metric == "Alpha" %}
-                            <td>{{ "%.4f (%.2f%%)" | format(value, value * 100) if value is number else value }}</td>
+                        {% elif metric in ["Market Exposure Effect (Cum.)", "Alpha (Risk-Adj) Annualized", "Alpha (Risk-Adj) Cumulative", "Outperformance Annualized", "Outperformance Cumulative"] %}
+                            <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
                         {% else %}
                             <td>{{ "%.4f" | format(value) if value is number else value }}</td>
                         {% endif %}
 
                         {# Benchmark Column #}
-                        {% if metric in ["Beta", "Alpha", "Information Ratio"] %}
+                        {% if metric in ["Beta", "Market Exposure Effect (Cum.)", "Alpha (Risk-Adj) Annualized", "Alpha (Risk-Adj) Cumulative", "Outperformance Annualized", "Outperformance Cumulative", "Information Ratio"] %}
                             <td>-</td>
                             <td>-</td>
                         {% else %}
                             {% set b_val = metrics.benchmark[metric] %}
-                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
+                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR", "Estimated Yield"] %}
                                 <td>{{ "%.2f%%" | format(b_val * 100) if b_val is number else b_val }}</td>
-                                {% set diff = value - b_val %}
+                                {% set diff = (value - b_val) if (value is number and b_val is number) else 0 %}
                                 <td style="color: {{ 'green' if diff > 0 else 'red' if diff < 0 else 'black' }}">
-                                    {{ "%+.2f%%" | format(diff * 100) }}
+                                    {{ "%+.2f%%" | format(diff * 100) if diff != 0 else "-" }}
                                 </td>
                             {% else %}
                                 <td>{{ "%.4f" | format(b_val) if b_val is number else b_val }}</td>
-                                {% set diff = value - b_val %}
+                                {% set diff = (value - b_val) if (value is number and b_val is number) else 0 %}
                                 <td style="color: {{ 'green' if diff > 0 else 'red' if diff < 0 else 'black' }}">
-                                    {{ "%+.4f" | format(diff) }}
+                                    {{ "%.4f" | format(diff) if diff != 0 else "-" }}
                                 </td>
                             {% endif %}
                         {% endif %}
@@ -1016,8 +1107,45 @@ def main():
     # Initialize dictionary to store performance metrics for each layer
     metrics = {}
 
+    # Fetch Sector and Industry Data (and Dividend Yield)
+    print("Fetching sector, industry and dividend yield data...")
+    portfolio_tickers = portfolio["ticker"].unique().tolist()
+    # Include benchmark ticker for fair yield comparison
+    all_tickers_for_info = list(set(portfolio_tickers + [benchmark_ticker]))
+    sector_industry_df = get_sector_industry_data(all_tickers_for_info)
+
+    # Calculate estimated yields
+    # Calculate risk contribution for individual positions to get weights
+    risk = calculate_risk_contribution(ts["positions"], ts["total"])
+    
+    # Merge risk (weights) with sector_industry_df (yields)
+    yield_analysis_df = risk[['Weight']].merge(sector_industry_df[['dividendYield']], left_index=True, right_index=True, how='left')
+    yield_analysis_df['dividendYield'] = yield_analysis_df['dividendYield'].fillna(0)
+    
+    # Calculate estimated portfolio yield
+    portfolio_yield = (yield_analysis_df['Weight'] * yield_analysis_df['dividendYield']).sum()
+    
+    # Calculate yields for components (defensive and active)
+    layer_yields = {"total": portfolio_yield}
+    for layer in ["defensive", "active"]:
+        layer_tickers = portfolio.loc[portfolio["type"] == layer, "ticker"].tolist()
+        layer_risk = risk[risk.index.isin(layer_tickers)]
+        layer_weight_sum = layer_risk['Weight'].sum()
+        
+        if layer_weight_sum > 0:
+            norm_weights = layer_risk['Weight'] / layer_weight_sum
+            layer_div_yields = sector_industry_df.loc[sector_industry_df.index.isin(layer_tickers), 'dividendYield'].fillna(0)
+            layer_yield = (norm_weights * layer_div_yields).sum()
+            layer_yields[layer] = layer_yield
+        else:
+            layer_yields[layer] = 0.0
+
+    # Calculate benchmark yield
+    benchmark_yield = sector_industry_df.loc[benchmark_ticker, 'dividendYield'] if benchmark_ticker in sector_industry_df.index else 0.0
+    if pd.isna(benchmark_yield): benchmark_yield = 0.0
+
     # Calculate performance metrics for the benchmark itself
-    benchmark_metrics = calculate_performance_metrics(benchmark, benchmark)
+    benchmark_metrics = calculate_performance_metrics(benchmark, benchmark, benchmark_yield=benchmark_yield)
     benchmark_var_cvar = calculate_var_cvar(benchmark)
     benchmark_metrics["VaR"] = benchmark_var_cvar["VaR"]
     benchmark_metrics["CVaR"] = benchmark_var_cvar["CVaR"]
@@ -1028,11 +1156,18 @@ def main():
         layer_returns = returns[layer]
         performance_metrics = calculate_performance_metrics(
             layer_returns,
-            benchmark
+            benchmark,
+            annual_yield=layer_yields[layer],
+            benchmark_yield=benchmark_yield
         )
-        var_cvar = calculate_var_cvar(layer_returns)
+        # For VaR and CVaR, we use the returns INCLUDING the yield (Total Return Risk)
+        daily_yield = (1 + layer_yields[layer]) ** (1/252) - 1
+        adjusted_layer_returns = layer_returns + daily_yield
+        var_cvar = calculate_var_cvar(adjusted_layer_returns)
+        
         performance_metrics["VaR"] = var_cvar["VaR"]
         performance_metrics["CVaR"] = var_cvar["CVaR"]
+        performance_metrics["Estimated Yield"] = layer_yields[layer]
         metrics[layer] = performance_metrics
 
     # Monte Carlo Simulation
@@ -1071,9 +1206,6 @@ def main():
     metrics["total"]["MC_VaR_95_Pct"] = mc_var_95_pct
     metrics["total"]["MC_Expected_Upside_95_Pct"] = mc_expected_upside_95_pct
 
-    # Calculate risk contribution for individual positions
-    risk = calculate_risk_contribution(ts["positions"], ts["total"])
-
     # Calculate returns for individual positions to compute correlation matrix
     pos_returns = ts["positions"].pct_change().dropna()
     corr = pos_returns.corr()
@@ -1082,13 +1214,8 @@ def main():
     # Set diagonal to a sentinel value (-2.0) to be colored gray
     corr = corr.mask(np.eye(len(corr), dtype=bool), -2.0)
 
-    # Fetch Sector and Industry Data
-    print("Fetching sector and industry data...")
-    portfolio_tickers = portfolio["ticker"].unique().tolist()
-    sector_industry_df = get_sector_industry_data(portfolio_tickers)
-
     # Generate interactive charts
-    charts = generate_charts(ts, risk, corr, benchmark_ticker)
+    charts = generate_charts(ts, risk, corr, benchmark_ticker, annual_yield=portfolio_yield)
 
     # Generate Sector and Industry Analysis
     print("Analyzing sector and industry weighting...")
