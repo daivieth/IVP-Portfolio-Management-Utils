@@ -105,6 +105,34 @@ def download_price_data(tickers, start_date, end_date):
 
 
 # =============================================================================
+# SECTOR AND INDUSTRY DATA
+# =============================================================================
+
+def get_sector_industry_data(tickers):
+    """
+    Fetches sector and industry information for a list of tickers using yfinance.
+
+    Args:
+        tickers (list): A list of ticker symbols.
+
+    Returns:
+        pd.DataFrame: A DataFrame with tickers as index and 'sector', 'industry' as columns.
+    """
+    data = []
+    for ticker in tickers:
+        try:
+            info = yf.Ticker(ticker).info
+            sector = info.get('sector', 'Unknown')
+            industry = info.get('industry', 'Unknown')
+            data.append({'ticker': ticker, 'sector': sector, 'industry': industry})
+        except Exception as e:
+            print(f"Warning: Could not fetch info for {ticker}: {e}")
+            data.append({'ticker': ticker, 'sector': 'Unknown', 'industry': 'Unknown'})
+    
+    return pd.DataFrame(data).set_index('ticker')
+
+
+# =============================================================================
 # BUILD PORTFOLIO TIMESERIES
 # =============================================================================
 def build_portfolio_timeseries(price_data, portfolio_df):
@@ -489,7 +517,76 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker):
     return charts
 
 
-def generate_monte_carlo_chart(mc_simulations): 
+def generate_sector_industry_analysis(risk_contrib, sector_industry_df):
+    """
+    Analyzes portfolio weighting per sector and industry.
+
+    Args:
+        risk_contrib (pd.DataFrame): DataFrame with "Weight" for each ticker.
+        sector_industry_df (pd.DataFrame): DataFrame with 'sector' and 'industry' for each ticker.
+
+    Returns:
+        dict: A dictionary containing:
+              - 'table_html': HTML string for the weighting table.
+              - 'pie_chart_html': HTML string for the sector pie chart.
+    """
+    # Merge risk contribution weights with sector/industry data
+    analysis_df = risk_contrib[['Weight']].merge(sector_industry_df, left_index=True, right_index=True, how='left')
+    analysis_df['sector'] = analysis_df['sector'].fillna('Unknown')
+    analysis_df['industry'] = analysis_df['industry'].fillna('Unknown')
+
+    # Calculate sector weights
+    sector_weights = analysis_df.groupby('sector')['Weight'].sum().sort_values(ascending=False)
+    
+    # Calculate industry weights within sectors
+    industry_weights = analysis_df.groupby(['sector', 'industry'])['Weight'].sum().reset_index()
+    industry_weights = industry_weights.sort_values(['sector', 'Weight'], ascending=[True, False])
+
+    # Generate HTML table
+    table_html = """
+    <table>
+        <thead>
+            <tr>
+                <th>Sector / Industry</th>
+                <th>Weight (%)</th>
+            </tr>
+        </thead>
+        <tbody>
+    """
+    for sector, s_weight in sector_weights.items():
+        table_html += f"""
+            <tr style="background-color: #eef7ff; font-weight: bold;">
+                <td>{sector}</td>
+                <td>{s_weight*100:.2f}%</td>
+            </tr>
+        """
+        s_industries = industry_weights[industry_weights['sector'] == sector]
+        for _, row in s_industries.iterrows():
+            table_html += f"""
+                <tr>
+                    <td style="padding-left: 20px;">&bull; {row['industry']}</td>
+                    <td>{row['Weight']*100:.2f}%</td>
+                </tr>
+            """
+    table_html += "</tbody></table>"
+
+    # Generate Sector Pie Chart
+    pie = px.pie(
+        values=sector_weights.values,
+        names=sector_weights.index,
+        height=650,
+        title="Portfolio Allocation by Sector",
+        hole=0.4
+    )
+    pie_chart_html = pie.to_html(full_html=False)
+
+    return {
+        'table_html': table_html,
+        'pie_chart_html': pie_chart_html
+    }
+
+
+def generate_monte_carlo_chart(mc_simulations):
     """
     Generates an interactive Plotly chart showing a subset of Monte Carlo simulation paths
     and the mean path, with Y-axis in percentage change from initial value.
@@ -702,6 +799,21 @@ def generate_html_report(metrics, charts, report_title):
  </div>
 
 <div class="chart-container">
+     <h2>Sector & Industry Exposure Analysis</h2>
+     <p>Insights on portfolio weighting per sector and industry to identify concentration risks and diversification levels.</p>
+     <div class="side-by-side-container">
+         <div style="flex: 1.2;">
+             <h3>Weighting per Sector and Industry</h3>
+             {{ charts.sector_table | safe }}
+         </div>
+         <div style="flex: 0.8;">
+             <h3>Sector Distribution</h3>
+             {{ charts.sector_pie | safe }}
+         </div>
+     </div>
+</div>
+
+<div class="chart-container">
      <h2>Monte Carlo Simulation Results (Total Portfolio)</h2>
      <table>
          <thead>
@@ -904,8 +1016,19 @@ def main():
     # Set diagonal to a sentinel value (-2.0) to be colored gray
     corr = corr.mask(np.eye(len(corr), dtype=bool), -2.0)
 
+    # Fetch Sector and Industry Data
+    print("Fetching sector and industry data...")
+    portfolio_tickers = portfolio["ticker"].unique().tolist()
+    sector_industry_df = get_sector_industry_data(portfolio_tickers)
+
     # Generate interactive charts
     charts = generate_charts(ts, risk, corr, benchmark_ticker)
+
+    # Generate Sector and Industry Analysis
+    print("Analyzing sector and industry weighting...")
+    sector_analysis = generate_sector_industry_analysis(risk, sector_industry_df)
+    charts["sector_table"] = sector_analysis["table_html"]
+    charts["sector_pie"] = sector_analysis["pie_chart_html"]
 
     # Generate Monte Carlo simulation chart
     mc_chart_html = generate_monte_carlo_chart(mc_simulations)
