@@ -758,12 +758,15 @@ def generate_html_report(metrics, charts, report_title):
         <h2>Metrics</h2>
         <div class="chart-container">
             {% for layer, data in metrics.items() %}
+            {% if layer != 'benchmark' %}
             <h3>{{ layer | title }} Component Metrics</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Metric</th>
-                        <th>Value</th>
+                        <th>Portfolio (Since Inception)</th>
+                        <th>Benchmark (Since Inception)</th>
+                        <th>Difference</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -771,16 +774,41 @@ def generate_html_report(metrics, charts, report_title):
                     {% if not (layer == 'total' and metric in ['MC_Expected_Drawdown_Pct', 'MC_VaR_99_Pct', 'MC_VaR_95_Pct', 'MC_Expected_Upside_95_Pct']) %}
                     <tr>
                         <td>{{ metric }}</td>
+                        {# Portfolio Column #}
                         {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
                             <td>{{ "%.2f%%" | format(value * 100) if value is number else value }}</td>
+                        {% elif metric == "Alpha" %}
+                            <td>{{ "%.4f (%.2f%%)" | format(value, value * 100) if value is number else value }}</td>
                         {% else %}
                             <td>{{ "%.4f" | format(value) if value is number else value }}</td>
+                        {% endif %}
+
+                        {# Benchmark Column #}
+                        {% if metric in ["Beta", "Alpha", "Information Ratio"] %}
+                            <td>-</td>
+                            <td>-</td>
+                        {% else %}
+                            {% set b_val = metrics.benchmark[metric] %}
+                            {% if metric in ["Annualized Return", "Cumulative Return", "Volatility", "Max Drawdown", "VaR", "CVaR"] %}
+                                <td>{{ "%.2f%%" | format(b_val * 100) if b_val is number else b_val }}</td>
+                                {% set diff = value - b_val %}
+                                <td style="color: {{ 'green' if diff > 0 else 'red' if diff < 0 else 'black' }}">
+                                    {{ "%+.2f%%" | format(diff * 100) }}
+                                </td>
+                            {% else %}
+                                <td>{{ "%.4f" | format(b_val) if b_val is number else b_val }}</td>
+                                {% set diff = value - b_val %}
+                                <td style="color: {{ 'green' if diff > 0 else 'red' if diff < 0 else 'black' }}">
+                                    {{ "%+.4f" | format(diff) }}
+                                </td>
+                            {% endif %}
                         {% endif %}
                     </tr>
                     {% endif %}
                     {% endfor %}
                 </tbody>
             </table>
+            {% endif %}
             {% endfor %}
          </div>
      </div>
@@ -956,6 +984,13 @@ def main():
 
     # Initialize dictionary to store performance metrics for each layer
     metrics = {}
+
+    # Calculate performance metrics for the benchmark itself
+    benchmark_metrics = calculate_performance_metrics(benchmark, benchmark)
+    benchmark_var_cvar = calculate_var_cvar(benchmark)
+    benchmark_metrics["VaR"] = benchmark_var_cvar["VaR"]
+    benchmark_metrics["CVaR"] = benchmark_var_cvar["CVaR"]
+    metrics["benchmark"] = benchmark_metrics
 
     # Calculate performance metrics for defensive, active, and total portfolio layers
     for layer in ["defensive","active","total"]:
