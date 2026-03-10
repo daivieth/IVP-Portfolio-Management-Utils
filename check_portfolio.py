@@ -100,8 +100,20 @@ def download_price_data(tickers, start_date, end_date):
         # If only one ticker, 'data' itself contains the prices
         prices = data
 
-    # Remove any rows with NaN values that might result from missing data for some dates
-    return prices.dropna()
+    # Check for tickers that have very little data (e.g., less than 1 month)
+    # This identifies "young" tickers that might be truncating the whole dataset if we use dropna()
+    data_counts = prices.count()
+    max_count = data_counts.max()
+    threshold = 20 # Minimum trading days
+    
+    young_tickers = data_counts[data_counts < threshold].index.tolist()
+    if young_tickers:
+        print(f"Warning: The following tickers have very little data and will be excluded to preserve backtest length: {young_tickers}")
+        prices = prices.drop(columns=young_tickers)
+
+    # Instead of dropping rows with ANY NaN (which truncates the whole history to the youngest asset),
+    # we return the raw prices and handle alignment later in the value calculation.
+    return prices
 
 
 # =============================================================================
@@ -161,7 +173,16 @@ def build_portfolio_timeseries(price_data, portfolio_df):
         ticker = row["ticker"]
         # Only include tickers for which price data was successfully downloaded
         if ticker in price_data.columns:
-            pos_values[ticker] = price_data[ticker] * row["quantity"]
+            # Fill forward missing prices to handle assets that started later or had gaps,
+            # but only AFTER their first valid price (inception).
+            # This ensures we don't have NaNs for the entire row just because one asset didn't exist yet.
+            ticker_prices = price_data[ticker].ffill()
+            pos_values[ticker] = ticker_prices * row["quantity"]
+
+    # For the portfolio calculation, we only consider dates where we have data.
+    # We fill NaNs with 0 for assets that haven't launched yet, so they don't contribute to total value,
+    # and they don't cause the entire row to be NaN.
+    pos_values = pos_values.fillna(0)
 
     # Separate tickers into core (defensive) and active lists
     core_tickers = portfolio_df.loc[portfolio_df["type"] == "defensive", "ticker"].tolist()
@@ -647,7 +668,7 @@ def generate_monte_carlo_chart(mc_simulations):
 # HTML REPORT
 # =============================================================================
 
-def generate_html_report(metrics, charts, report_title):
+def generate_html_report(metrics, charts, report_title, inception_date):
     """
     Generates a comprehensive HTML report summarizing portfolio performance,
     metrics, allocation, and correlations.
@@ -659,10 +680,12 @@ def generate_html_report(metrics, charts, report_title):
                         different portfolio layers (e.g., 'defensive', 'active', 'total').
         charts (dict): A dictionary containing HTML strings of generated Plotly charts.
         report_title (str): The title to display at the top of the HTML report.
+        inception_date (datetime): The start date of the backtest for display.
 
     Returns:
         None: The function writes the HTML report to "portfolio_report.html".
     """
+    formatted_date = inception_date.strftime("%Y-%m-%d")
     template = Template("""
 <html>
 
@@ -748,7 +771,7 @@ def generate_html_report(metrics, charts, report_title):
 
 <h1>{{ report_title }}</h1>
 
-<h2>Portfolio 5-Year Backtest</h2>
+<h2>Portfolio Backtest (Since {{ inception_date }})</h2>
 <div class="chart-container">
     {{ charts.value | safe }}
 </div>
@@ -764,8 +787,8 @@ def generate_html_report(metrics, charts, report_title):
                 <thead>
                     <tr>
                         <th>Metric</th>
-                        <th>Portfolio (Since Inception)</th>
-                        <th>Benchmark (Since Inception)</th>
+                        <th>Portfolio (Since {{ inception_date }})</th>
+                        <th>Benchmark (Since {{ inception_date }})</th>
                         <th>Difference</th>
                     </tr>
                 </thead>
@@ -895,7 +918,7 @@ def generate_html_report(metrics, charts, report_title):
 """)
 
     # Render the template with the provided metrics, charts, and title
-    html = template.render(metrics=metrics, charts=charts, report_title=report_title)
+    html = template.render(metrics=metrics, charts=charts, report_title=report_title, inception_date=formatted_date)
 
     # Write the generated HTML content to a file
     with open("portfolio_report.html","w") as f:
@@ -931,6 +954,7 @@ def main():
     """
     # Prompt user for report title
     report_title = input("Enter the portfolio report title: ")
+    inception_date_str = input("Enter the inception date (YYYY-MM-DD, default: 5 years ago): ")
     print("Starting portfolio analysis...")
 
     # Load portfolio data from Excel files
@@ -948,9 +972,16 @@ def main():
     if "^AXJO" not in tickers: # Always add ^AXJO as a fallback
         tickers.append("^AXJO")
 
-    # Define the date range for historical data download (last 5 years)
+    # Define the date range for historical data download
     end = datetime.now()
-    start = end - timedelta(days=5*365) # Approximately 5 years
+    if inception_date_str:
+        try:
+            start = datetime.strptime(inception_date_str, "%Y-%m-%d")
+        except ValueError:
+            print(f"Warning: Invalid date format '{inception_date_str}'. Falling back to 5 years ago.")
+            start = end - timedelta(days=5*365)
+    else:
+        start = end - timedelta(days=5*365) # Approximately 5 years
 
     # Download historical price data for all identified tickers
     prices = download_price_data(tickers, start, end)
@@ -1070,7 +1101,7 @@ def main():
     charts["monte_carlo"] = mc_chart_html
 
     # Generate and save the HTML report
-    generate_html_report(metrics, charts, report_title)
+    generate_html_report(metrics, charts, report_title, start)
 
     print("Analysis complete. Check 'portfolio_report.html' for the detailed report.")
 
