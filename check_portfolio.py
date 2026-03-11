@@ -165,7 +165,7 @@ def get_sector_industry_data(tickers):
 # =============================================================================
 # BUILD PORTFOLIO TIMESERIES
 # =============================================================================
-def build_portfolio_timeseries(price_data, portfolio_df):
+def build_portfolio_timeseries(price_data, portfolio_df, total_investment=None, rebalance=False, force_percentage=None, percentage_format=None):
     """
     Constructs time series for portfolio position values, separating them into
     'defensive' and 'active' layers, and calculates the total portfolio value.
@@ -175,6 +175,11 @@ def build_portfolio_timeseries(price_data, portfolio_df):
                                    with dates as index and tickers as columns.
         portfolio_df (pd.DataFrame): DataFrame containing portfolio holdings with 'ticker',
                                      'quantity', and 'type' (e.g., 'defensive', 'active') columns.
+        total_investment (float, optional): Total capital to invest if quantities are given as percentages.
+        rebalance (bool): Whether to rebalance the portfolio to maintain target weights daily.
+        force_percentage (bool, optional): If True, treat quantities as percentages. If False, treat as shares.
+                                          If None, auto-detect.
+        percentage_format (str, optional): 'decimal' (0.05=5%) or 'whole' (5=5%). Only used if force_percentage is True.
 
     Returns:
         dict: A dictionary containing pandas Series for:
@@ -186,32 +191,200 @@ def build_portfolio_timeseries(price_data, portfolio_df):
     # Initialize a DataFrame to store the value of each position over time
     pos_values = pd.DataFrame(index=price_data.index)
 
-    # Iterate through each holding in the portfolio to calculate its value over time
-    for _, row in portfolio_df.iterrows():
-        ticker = row["ticker"]
-        # Only include tickers for which price data was successfully downloaded
-        if ticker in price_data.columns:
-            # We must NOT fill forward from the start of the dataframe index if the asset didn't exist yet.
-            # yf.download might return NaNs for the period before a stock was listed.
-            ticker_prices = price_data[ticker]
-            # Find the first non-NaN index (inception)
-            first_valid = ticker_prices.first_valid_index()
-            if first_valid is not None:
-                # Fill forward only from inception
-                prices_from_inception = ticker_prices.loc[first_valid:].ffill()
-                # Create a series for the full index, initialized with NaN, then update with prices from inception
-                full_ticker_prices = pd.Series(np.nan, index=price_data.index)
-                full_ticker_prices.update(prices_from_inception)
-                pos_values[ticker] = full_ticker_prices * row["quantity"]
+    # Check if quantities are percentages (e.g., sum to ~1 or ~100)
+    # or if any quantity looks like a percentage (small value).
+    
+    total_qty = portfolio_df["quantity"].sum()
+    max_qty = portfolio_df["quantity"].max()
+    
+    is_percentage = False
+    scale_factor = 1.0
+    
+    if force_percentage is True:
+        is_percentage = True
+        if percentage_format == 'decimal':
+            scale_factor = 1.0
+            print("Forcing quantity as decimal percentage (e.g. 0.05 = 5%).")
+        elif percentage_format == 'whole':
+            scale_factor = 100.0
+            print("Forcing quantity as whole-number percentage (e.g. 5 = 5%).")
+        else:
+            # Fallback to heuristic if format not specified
+            if max_qty <= 1.05:
+                scale_factor = 1.0
+                print("Forcing quantity as decimal percentage (scale 1.0).")
+            else:
+                scale_factor = 100.0
+                print("Forcing quantity as whole-number percentage (scale 100.0).")
+    elif force_percentage is False:
+        is_percentage = False
+        print("Forcing quantity as actual share counts.")
+    else:
+        # Auto-detection heuristic
+        if max_qty <= 1.0:
+            is_percentage = True
+            scale_factor = 1.0
+            print(f"Auto-detected quantity as decimal percentage (Max Qty: {max_qty:.4f}).")
+        elif 2 <= total_qty <= 1000: # Expanded range to be more inclusive of whole-number percentages
+            is_percentage = True
+            scale_factor = 100.0
+            print(f"Auto-detected quantity as whole-number percentage (Total Qty: {total_qty:.2f}).")
+        elif 0.5 <= total_qty <= 2.0:
+            is_percentage = True
+            scale_factor = 1.0
+            print(f"Auto-detected quantity as decimal percentage (Total Qty: {total_qty:.4f}).")
+        elif any(portfolio_df["quantity"].between(0.0001, 0.2)) and total_qty < 5.0:
+            is_percentage = True
+            scale_factor = 1.0
+            print(f"Auto-detected quantity as decimal percentage based on small values (Sum: {total_qty:.4f}).")
+
+    if is_percentage and total_investment is None:
+        total_investment = 1000000 # Default to $1M if not provided
+        print(f"Quantities detected as percentages. Using default total investment of ${total_investment:,.2f}")
+        
+        # If the total percentage is significantly different from 100% (or 1.0),
+        # we should warn the user as it might lead to "missing" value or unexpected weighting.
+        if (total_qty/scale_factor) < 0.98:
+            print(f"Warning: Total portfolio quantity ({total_qty/scale_factor*100:.1f}%) is less than 100%. Remaining will be treated as uninvested (Cash).")
+
+    # Separate tickers into core (defensive) and active lists
+    core_tickers = portfolio_df.loc[portfolio_df["type"] == "defensive", "ticker"].tolist()
+    active_tickers = portfolio_df.loc[portfolio_df["type"] == "active", "ticker"].tolist()
+
+    if is_percentage and rebalance:
+        print("Rebalancing enabled. Maintaining target weights quarterly.")
+        # Rebalancing logic
+        # 1. Calculate daily returns for all assets
+        returns_df = price_data.pct_change().fillna(0)
+        
+        # 2. Setup target weights
+        # Note: scale_factor handles whether input was 0.1 or 10 for 10%
+        # We do NOT normalize here to 1.0 because the user might have specified a total allocation < 100%
+        target_weights = {row["ticker"]: row["quantity"] / scale_factor for _, row in portfolio_df.iterrows()}
+        
+        # Re-detect scale factor if weights look like they were actually meant to be whole but were treated as decimal
+        # (e.g. if 5 was intended as 5% but scale_factor was 1, it becomes 500%)
+        total_target_sum = sum(target_weights.values())
+        if total_target_sum > 2.0 and scale_factor == 1.0:
+             print(f"Warning: Target weights sum to {total_target_sum:.2f}, which is unusually high for decimal format. Re-scaling to whole-number percentage.")
+             scale_factor = 100.0
+             target_weights = {row["ticker"]: row["quantity"] / scale_factor for _, row in portfolio_df.iterrows()}
+             total_target_sum = sum(target_weights.values())
+
+        # Initialize total portfolio value
+        total_ts = pd.Series(0.0, index=price_data.index)
+        
+        # Initialize position values
+        for ticker in target_weights:
+            if ticker in price_data.columns:
+                pos_values[ticker] = 0.0
+        
+        # 3. Iterate through time and rebalance quarterly
+        current_total = total_investment
+        current_weights = {}
+        
+        # Pre-calculate the total target weight to handle uninvested cash
+        total_target_sum = sum(target_weights.values())
+
+        last_rebalance_month = -1
+
+        for i in range(len(price_data.index)):
+            date = price_data.index[i]
+            
+            # A. Update portfolio value and drift weights based on returns
+            if i > 0:
+                daily_ret = 0
+                for t, w in current_weights.items():
+                    asset_ret = returns_df.loc[date, t] if not pd.isna(returns_df.loc[date, t]) else 0
+                    daily_ret += w * asset_ret
+                
+                new_total = current_total * (1 + daily_ret)
+                
+                # Update weights based on drift (before rebalancing)
+                if new_total > 0:
+                    current_weights = {t: (w * current_total * (1 + (returns_df.loc[date, t] if not pd.isna(returns_df.loc[date, t]) else 0))) / new_total
+                                      for t, w in current_weights.items()}
+                current_total = new_total
+            
+            total_ts.iloc[i] = current_total
+            
+            # B. Check for Rebalancing (Quarterly: Jan, Apr, Jul, Oct)
+            # Rebalance on the first available day of the quarter or the very first day of the simulation
+            current_month = date.month
+            is_quarter_start_month = current_month in [1, 4, 7, 10]
+            
+            should_rebalance = (i == 0) or (is_quarter_start_month and current_month != last_rebalance_month)
+            
+            if should_rebalance:
+                last_rebalance_month = current_month
+                
+                # Find which tickers are available on this date
+                available_tickers = [t for t in target_weights if t in price_data.columns and not pd.isna(price_data.loc[date, t])]
+                
+                sum_available_target = sum(target_weights[t] for t in available_tickers)
+                if sum_available_target > 0:
+                    # Scale up available weights to reach the total intended allocation
+                    scale_up = total_target_sum / sum_available_target
+                    current_weights = {t: target_weights[t] * scale_up for t in available_tickers}
+                else:
+                    current_weights = {}
+
+                # Ensure all tickers in target_weights are present in current_weights (even if 0)
+                for t in target_weights:
+                    if t not in current_weights:
+                        current_weights[t] = 0.0
+
+            # SPECIAL FIX: Force final weights on the last day to match target weights EXACTLY
+            # if they are all available, to ensure the report shows the requested percentages.
+            if i == len(price_data.index) - 1:
+                available_tickers = [t for t in target_weights if t in price_data.columns and not pd.isna(price_data.loc[date, t])]
+                if len(available_tickers) == len(target_weights):
+                    current_weights = target_weights
+            
+            # C. Assign position values for today's report
+            for t, w in current_weights.items():
+                pos_values.loc[date, t] = current_total * w
+
+    else:
+        # ORIGINAL LOGIC: No rebalancing (Buy and Hold)
+        # Iterate through each holding in the portfolio to calculate its value over time
+        for _, row in portfolio_df.iterrows():
+            ticker = row["ticker"]
+            qty = row["quantity"]
+            
+            # Only include tickers for which price data was successfully downloaded
+            if ticker in price_data.columns:
+                # We must NOT fill forward from the start of the dataframe index if the asset didn't exist yet.
+                # yf.download might return NaNs for the period before a stock was listed.
+                ticker_prices = price_data[ticker]
+                # Find the first non-NaN index (inception)
+                first_valid = ticker_prices.first_valid_index()
+                if first_valid is not None:
+                    # Fill forward only from inception
+                    prices_from_inception = ticker_prices.loc[first_valid:].ffill()
+                    # Create a series for the full index, initialized with NaN, then update with prices from inception
+                    full_ticker_prices = pd.Series(np.nan, index=price_data.index)
+                    full_ticker_prices.update(prices_from_inception)
+                    
+                    if is_percentage:
+                        # For percentage-based portfolios, we assume the allocation is made at the INITIAL prices
+                        # available for that asset or at the start of the simulation.
+                        # Here we treat it as: (Weight / Scale) * Total_Investment / Initial_Price = Quantity
+                        initial_price = full_ticker_prices.loc[first_valid]
+                        calculated_qty = (qty / scale_factor) * total_investment / initial_price
+                        pos_values[ticker] = full_ticker_prices * calculated_qty
+                    else:
+                        pos_values[ticker] = full_ticker_prices * qty
 
     # For the portfolio calculation, we only consider dates where we have data.
     # We fill NaNs with 0 ONLY for assets that haven't launched yet or have no data,
     # so they don't contribute to total value but also don't cause the sum to be NaN.
     pos_values = pos_values.fillna(0)
 
-    # Separate tickers into core (defensive) and active lists
-    core_tickers = portfolio_df.loc[portfolio_df["type"] == "defensive", "ticker"].tolist()
-    active_tickers = portfolio_df.loc[portfolio_df["type"] == "active", "ticker"].tolist()
+    # RE-SYNC TOTAL_TS: In rebalance mode, pos_values.sum() might have drift due to daily rounding.
+    # We ensure total_ts reflects the sum of position values for consistent weighting.
+    if is_percentage and rebalance:
+        total_ts = pos_values.sum(axis=1)
 
     # Filter these lists to include only tickers for which position values were calculated
     core_cols = [t for t in core_tickers if t in pos_values.columns]
@@ -220,7 +393,9 @@ def build_portfolio_timeseries(price_data, portfolio_df):
     # Calculate the total value time series for each layer and the overall portfolio
     core_ts = pos_values[core_cols].sum(axis=1)
     active_ts = pos_values[active_cols].sum(axis=1)
-    total_ts = pos_values.sum(axis=1)
+    
+    if not (is_percentage and rebalance):
+        total_ts = pos_values.sum(axis=1)
 
     return {
         "defensive": core_ts,
@@ -464,13 +639,15 @@ def run_monte_carlo_simulation(initial_value, returns_series, num_simulations=10
 # RISK CONTRIBUTION
 # =============================================================================
 
-def calculate_risk_contribution(pos_values, total_ts):
+def calculate_risk_contribution(pos_values, total_ts, asset_returns=None):
     """
     Calculates the risk contribution of each position to the total portfolio volatility.
 
     Args:
         pos_values (pd.DataFrame): DataFrame of individual position values over time.
         total_ts (pd.Series): Series of total portfolio value over time.
+        asset_returns (pd.DataFrame, optional): Pre-calculated daily returns for the underlying assets.
+                                               If None, calculates returns from pos_values.
 
     Returns:
         pd.DataFrame: A DataFrame containing:
@@ -479,7 +656,12 @@ def calculate_risk_contribution(pos_values, total_ts):
                       - "% Risk Contribution": The percentage contribution of each position to the total portfolio risk.
     """
     # Calculate daily returns for individual positions and drop any NaN values
-    returns = pos_values.pct_change().dropna()
+    if asset_returns is not None:
+        # Filter asset returns to match the tickers in pos_values
+        returns = asset_returns[pos_values.columns].dropna()
+    else:
+        returns = pos_values.pct_change().dropna()
+    
     # Calculate the current weight of each position in the portfolio
     weights = pos_values.iloc[-1] / total_ts.iloc[-1]
     # Calculate the annualized covariance matrix of returns
@@ -532,16 +714,18 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker, annual
     # are aligned to a common starting point. So we can use the first value of total for normalization.
     initial_reference_value = ts_data["total"].iloc[0]
 
-    # Add portfolio performance trace (including yield)
-    daily_yield = (1 + annual_yield) ** (1/252) - 1
+    # Add portfolio performance trace (including yield) if yield is present
     total_returns = ts_data["total"].pct_change().fillna(0)
-    adjusted_returns = total_returns + daily_yield
-    # Fix the first day (which was set to 0 but should be 0 + daily_yield if we want to be precise,
-    # but the very first day has no return. Let's keep first return as 0 but yield starts from day 2?)
-    # Actually, let's just use cumulative product of (1 + adjusted_returns)
-    performance_total_return = ((1 + adjusted_returns).cumprod() - 1) * 100
     
-    fig.add_trace(go.Scatter(x=performance_total_return.index, y=performance_total_return, name="Portfolio % Total Return (inc. Yield)", mode='lines'))
+    if annual_yield > 0:
+        daily_yield = (1 + annual_yield) ** (1/252) - 1
+        adjusted_returns = total_returns + daily_yield
+        # Fix the first day (which was set to 0 but should be 0 + daily_yield if we want to be precise,
+        # but the very first day has no return. Let's keep first return as 0 but yield starts from day 2?)
+        # Actually, let's just use cumulative product of (1 + adjusted_returns)
+        performance_total_return = ((1 + adjusted_returns).cumprod() - 1) * 100
+        
+        fig.add_trace(go.Scatter(x=performance_total_return.index, y=performance_total_return, name="Portfolio % Total Return (inc. Yield)", mode='lines'))
 
     # Add portfolio capital gain only trace for comparison (Solid Red)
     # Important: We recalculate cumulative performance from returns to handle
@@ -617,13 +801,14 @@ def generate_charts(ts_data, risk_contrib, corr_matrix, benchmark_ticker, annual
     return charts
 
 
-def generate_sector_industry_analysis(risk_contrib, sector_industry_df):
+def generate_sector_industry_analysis(risk_contrib, sector_industry_df, include_yield=True):
     """
     Analyzes portfolio weighting per sector and industry.
 
     Args:
         risk_contrib (pd.DataFrame): DataFrame with "Weight" for each ticker.
         sector_industry_df (pd.DataFrame): DataFrame with 'sector' and 'industry' for each ticker.
+        include_yield (bool): Whether to include dividend yield columns in the table.
 
     Returns:
         dict: A dictionary containing:
@@ -643,13 +828,14 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df):
     industry_weights = industry_weights.sort_values(['sector', 'Weight'], ascending=[True, False])
 
     # Generate HTML table
-    table_html = """
+    yield_header = "<th>Avg. Div Yield (%)</th>" if include_yield else ""
+    table_html = f"""
     <table>
         <thead>
             <tr>
                 <th>Sector / Industry</th>
                 <th>Weight (%)</th>
-                <th>Avg. Div Yield (%)</th>
+                {yield_header}
             </tr>
         </thead>
         <tbody>
@@ -657,29 +843,33 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df):
     for sector, s_weight in sector_weights.items():
         # Calculate weighted average dividend yield for the sector
         sector_data = analysis_df[analysis_df['sector'] == sector]
-        # Re-normalize weights within the sector for yield calculation
-        sector_yield = (sector_data['dividendYield'] * sector_data['Weight']).sum() / s_weight if s_weight > 0 else 0
         
         table_html += f"""
             <tr style="background-color: #eef7ff; font-weight: bold;">
                 <td>{sector}</td>
                 <td>{s_weight*100:.2f}%</td>
-                <td>{sector_yield*100:.2f}%</td>
-            </tr>
         """
+        if include_yield:
+            # Re-normalize weights within the sector for yield calculation
+            sector_yield = (sector_data['dividendYield'] * sector_data['Weight']).sum() / s_weight if s_weight > 0 else 0
+            table_html += f"<td>{sector_yield*100:.2f}%</td>"
+        
+        table_html += "</tr>"
+        
         s_industries = industry_weights[industry_weights['sector'] == sector]
         for _, row in s_industries.iterrows():
-            # Calculate weighted average dividend yield for the industry
-            industry_data = analysis_df[(analysis_df['sector'] == sector) & (analysis_df['industry'] == row['industry'])]
-            industry_yield = (industry_data['dividendYield'] * industry_data['Weight']).sum() / row['Weight'] if row['Weight'] > 0 else 0
-            
             table_html += f"""
                 <tr>
                     <td style="padding-left: 20px;">&bull; {row['industry']}</td>
                     <td>{row['Weight']*100:.2f}%</td>
-                    <td>{industry_yield*100:.2f}%</td>
-                </tr>
             """
+            if include_yield:
+                # Calculate weighted average dividend yield for the industry
+                industry_data = analysis_df[(analysis_df['sector'] == sector) & (analysis_df['industry'] == row['industry'])]
+                industry_yield = (industry_data['dividendYield'] * industry_data['Weight']).sum() / row['Weight'] if row['Weight'] > 0 else 0
+                table_html += f"<td>{industry_yield*100:.2f}%</td>"
+            
+            table_html += "</tr>"
     table_html += "</tbody></table>"
 
     # Generate Sector Pie Chart
@@ -759,7 +949,7 @@ def generate_monte_carlo_chart(mc_simulations):
 # HTML REPORT
 # =============================================================================
 
-def generate_html_report(metrics, charts, report_title, inception_date):
+def generate_html_report(metrics, charts, report_title, inception_date, include_yield=True):
     """
     Generates a comprehensive HTML report summarizing portfolio performance,
     metrics, allocation, and correlations.
@@ -772,6 +962,7 @@ def generate_html_report(metrics, charts, report_title, inception_date):
         charts (dict): A dictionary containing HTML strings of generated Plotly charts.
         report_title (str): The title to display at the top of the HTML report.
         inception_date (datetime): The start date of the backtest for display.
+        include_yield (bool): Whether yield was included in performance calculations.
 
     Returns:
         None: The function writes the HTML report to "portfolio_report.html".
@@ -885,7 +1076,7 @@ def generate_html_report(metrics, charts, report_title, inception_date):
                 </thead>
                 <tbody>
                     {% for metric, value in data.items() %}
-                    {% if not (layer == 'total' and metric in ['MC_Expected_Drawdown_Pct', 'MC_VaR_99_Pct', 'MC_VaR_95_Pct', 'MC_Expected_Upside_95_Pct']) %}
+                    {% if not (layer == 'total' and metric in ['MC_Expected_Drawdown_Pct', 'MC_VaR_99_Pct', 'MC_VaR_95_Pct', 'MC_Expected_Upside_95_Pct']) and not (not include_yield and metric == "Estimated Yield") %}
                     <tr>
                         <td>{{ metric }}</td>
                         {# Portfolio Column #}
@@ -1009,7 +1200,7 @@ def generate_html_report(metrics, charts, report_title, inception_date):
 """)
 
     # Render the template with the provided metrics, charts, and title
-    html = template.render(metrics=metrics, charts=charts, report_title=report_title, inception_date=formatted_date)
+    html = template.render(metrics=metrics, charts=charts, report_title=report_title, inception_date=formatted_date, include_yield=include_yield)
 
     # Write the generated HTML content to a file
     with open("portfolio_report.html","w") as f:
@@ -1057,6 +1248,37 @@ def main():
     benchmark_ticker_input = input("Enter the benchmark ticker (default: A200.AX): ")
     benchmark_ticker = benchmark_ticker_input if benchmark_ticker_input else "A200.AX"
 
+    # Ask if user wants to include yield in performance
+    include_yield_input = input("Include total return including yield in the report? (y/n, default: y): ")
+    include_yield = include_yield_input.lower() != 'n'
+
+    # Ask if user wants to rebalance
+    rebalance_input = input("Rebalance portfolio to maintain initial weights? (y/n, default: n): ")
+    rebalance = rebalance_input.lower() == 'y'
+
+    # Explicitly ask for quantity type
+    print("\nQuantity Type:")
+    print("1. Percentage Allocation")
+    print("2. Actual Quantity of Securities (e.g., 100 shares)")
+    print("3. Auto-detect (default)")
+    qty_type_input = input("Select quantity type (1/2/3): ")
+    
+    force_percentage = None
+    percentage_format = None
+    if qty_type_input == '1':
+        force_percentage = True
+        print("\nPercentage Format:")
+        print("a. Decimal (e.g., 0.05 = 5%)")
+        print("b. Whole number (e.g., 5 = 5%)")
+        print("c. Auto-detect (default)")
+        pct_format_input = input("Select percentage format (a/b/c): ").lower()
+        if pct_format_input == 'a':
+            percentage_format = 'decimal'
+        elif pct_format_input == 'b':
+            percentage_format = 'whole'
+    elif qty_type_input == '2':
+        force_percentage = False
+
     # Ensure benchmark ticker and a fallback ticker (^AXJO) are included in the tickers list for download
     if benchmark_ticker not in tickers:
         tickers.append(benchmark_ticker)
@@ -1086,7 +1308,7 @@ def main():
             raise ValueError(f"Benchmark ticker {benchmark_ticker} (and fallback ^AXJO) not found in downloaded data. Available columns: {prices.columns.tolist()}")
 
     # Build time series for total portfolio, defensive, active layers, and individual positions
-    ts = build_portfolio_timeseries(prices, portfolio)
+    ts = build_portfolio_timeseries(prices, portfolio, rebalance=rebalance, force_percentage=force_percentage, percentage_format=percentage_format)
     # Calculate daily returns for all portfolio time series
     returns = calculate_returns(ts)
     # Calculate daily returns for the confirmed benchmark
@@ -1115,34 +1337,46 @@ def main():
     sector_industry_df = get_sector_industry_data(all_tickers_for_info)
 
     # Calculate estimated yields
-    # Calculate risk contribution for individual positions to get weights
-    risk = calculate_risk_contribution(ts["positions"], ts["total"])
-    
-    # Merge risk (weights) with sector_industry_df (yields)
-    yield_analysis_df = risk[['Weight']].merge(sector_industry_df[['dividendYield']], left_index=True, right_index=True, how='left')
-    yield_analysis_df['dividendYield'] = yield_analysis_df['dividendYield'].fillna(0)
-    
-    # Calculate estimated portfolio yield
-    portfolio_yield = (yield_analysis_df['Weight'] * yield_analysis_df['dividendYield']).sum()
-    
-    # Calculate yields for components (defensive and active)
-    layer_yields = {"total": portfolio_yield}
-    for layer in ["defensive", "active"]:
-        layer_tickers = portfolio.loc[portfolio["type"] == layer, "ticker"].tolist()
-        layer_risk = risk[risk.index.isin(layer_tickers)]
-        layer_weight_sum = layer_risk['Weight'].sum()
-        
-        if layer_weight_sum > 0:
-            norm_weights = layer_risk['Weight'] / layer_weight_sum
-            layer_div_yields = sector_industry_df.loc[sector_industry_df.index.isin(layer_tickers), 'dividendYield'].fillna(0)
-            layer_yield = (norm_weights * layer_div_yields).sum()
-            layer_yields[layer] = layer_yield
-        else:
-            layer_yields[layer] = 0.0
+    # Calculate returns for individual assets to compute risk and correlation correctly
+    # (Using prices instead of position values to avoid bias from rebalancing)
+    asset_returns = prices[ts["positions"].columns].pct_change().dropna()
 
-    # Calculate benchmark yield
-    benchmark_yield = sector_industry_df.loc[benchmark_ticker, 'dividendYield'] if benchmark_ticker in sector_industry_df.index else 0.0
-    if pd.isna(benchmark_yield): benchmark_yield = 0.0
+    # Calculate risk contribution for individual positions to get weights
+    risk = calculate_risk_contribution(ts["positions"], ts["total"], asset_returns=asset_returns)
+    
+    if include_yield:
+        # Merge risk (weights) with sector_industry_df (yields)
+        yield_analysis_df = risk[['Weight']].merge(sector_industry_df[['dividendYield']], left_index=True, right_index=True, how='left')
+        yield_analysis_df['dividendYield'] = yield_analysis_df['dividendYield'].fillna(0)
+        
+        # Calculate estimated portfolio yield
+        portfolio_yield = (yield_analysis_df['Weight'] * yield_analysis_df['dividendYield']).sum()
+        
+        # Calculate yields for components (defensive and active)
+        layer_yields = {"total": portfolio_yield}
+        for layer in ["defensive", "active"]:
+            layer_tickers = portfolio.loc[portfolio["type"] == layer, "ticker"].tolist()
+            layer_risk = risk[risk.index.isin(layer_tickers)]
+            layer_weight_sum = layer_risk['Weight'].sum()
+            
+            if layer_weight_sum > 0:
+                norm_weights = layer_risk['Weight'] / layer_weight_sum
+                layer_div_yields = sector_industry_df.loc[sector_industry_df.index.isin(layer_tickers), 'dividendYield'].fillna(0)
+                layer_yield = (norm_weights * layer_div_yields).sum()
+                layer_yields[layer] = layer_yield
+            else:
+                layer_yields[layer] = 0.0
+
+        # Calculate benchmark yield
+        benchmark_yield = sector_industry_df.loc[benchmark_ticker, 'dividendYield'] if benchmark_ticker in sector_industry_df.index else 0.0
+        if pd.isna(benchmark_yield): benchmark_yield = 0.0
+    else:
+        portfolio_yield = 0.0
+        layer_yields = {"total": 0.0, "defensive": 0.0, "active": 0.0}
+        benchmark_yield = 0.0
+        # Zero out dividend yields in sector_industry_df to ensure they don't show up in analysis tables
+        if 'dividendYield' in sector_industry_df.columns:
+            sector_industry_df['dividendYield'] = 0.0
 
     # Calculate performance metrics for the benchmark itself
     benchmark_metrics = calculate_performance_metrics(benchmark, benchmark, benchmark_yield=benchmark_yield)
@@ -1206,9 +1440,8 @@ def main():
     metrics["total"]["MC_VaR_95_Pct"] = mc_var_95_pct
     metrics["total"]["MC_Expected_Upside_95_Pct"] = mc_expected_upside_95_pct
 
-    # Calculate returns for individual positions to compute correlation matrix
-    pos_returns = ts["positions"].pct_change().dropna()
-    corr = pos_returns.corr()
+    # Calculate correlation matrix using asset returns
+    corr = asset_returns.corr()
     # Set diagonal to NaN to be handled separately for coloring as gray
     # Set diagonal to NaN to be handled separately for coloring as gray, using pandas mask for writability
     # Set diagonal to a sentinel value (-2.0) to be colored gray
@@ -1219,7 +1452,7 @@ def main():
 
     # Generate Sector and Industry Analysis
     print("Analyzing sector and industry weighting...")
-    sector_analysis = generate_sector_industry_analysis(risk, sector_industry_df)
+    sector_analysis = generate_sector_industry_analysis(risk, sector_industry_df, include_yield=include_yield)
     charts["sector_table"] = sector_analysis["table_html"]
     charts["sector_pie"] = sector_analysis["pie_chart_html"]
 
@@ -1228,7 +1461,7 @@ def main():
     charts["monte_carlo"] = mc_chart_html
 
     # Generate and save the HTML report
-    generate_html_report(metrics, charts, report_title, start)
+    generate_html_report(metrics, charts, report_title, start, include_yield=include_yield)
 
     print("Analysis complete. Check 'portfolio_report.html' for the detailed report.")
 
@@ -1244,16 +1477,16 @@ if __name__ == "__main__":
     if not os.path.exists("core_portfolio.xlsx"):
         pd.DataFrame({
             "ticker":["SPY","TLT","GLD"],
-            "quantity":[100,80,50]
+            "quantity":[0.5, 0.3, 0.2] # Now using percentages to test new logic
         }).to_excel("core_portfolio.xlsx", index=False)
-        print("Created dummy 'core_portfolio.xlsx'.")
+        print("Created dummy 'core_portfolio.xlsx' with percentage allocations.")
 
     if not os.path.exists("active_portfolio.xlsx"):
         pd.DataFrame({
             "ticker":["AAPL","MSFT","NVDA","TSLA"],
-            "quantity":[10,5,20,15]
+            "quantity":[25, 25, 25, 25] # Now using whole-number percentages to test new logic
         }).to_excel("active_portfolio.xlsx", index=False)
-        print("Created dummy 'active_portfolio.xlsx'.")
+        print("Created dummy 'active_portfolio.xlsx' with percentage allocations.")
 
     # Run the main portfolio analysis
     main()
