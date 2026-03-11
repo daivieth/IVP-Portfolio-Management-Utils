@@ -127,37 +127,62 @@ def download_price_data(tickers, start_date, end_date):
 
 def get_sector_industry_data(tickers):
     """
-    Fetches sector, industry and dividend yield information for a list of tickers using yfinance.
+    Fetches comprehensive information including sector, industry, market cap, growth, and P/E for a list of tickers using yfinance.
 
     Args:
         tickers (list): A list of ticker symbols.
 
     Returns:
-        pd.DataFrame: A DataFrame with tickers as index and 'sector', 'industry', 'dividendYield' as columns.
+        pd.DataFrame: A DataFrame with tickers as index and metadata as columns.
     """
     data = []
     for ticker in tickers:
         try:
             info = yf.Ticker(ticker).info
-            sector = info.get('sector', 'Unknown')
-            industry = info.get('industry', 'Unknown')
+            sector = info.get('sector', 'Others')
+            industry = info.get('industry', 'Others')
             div_yield = info.get('dividendYield', 0.0)
+            name = info.get('longName', ticker)
+            market_cap = info.get('marketCap', 0.0)
+            eps_growth = info.get('earningsGrowth', 0.0)
+            forward_pe = info.get('forwardPE', 0.0)
             
             # yfinance often returns dividendYield as a decimal (e.g. 0.05 for 5%)
-            # but sometimes it might be returned as a whole number.
-            # We standardize it as a decimal (0.01 = 1%).
             if div_yield is None:
                 div_yield = 0.0
             
-            # Heuristic check: if yield is > 1.0 (e.g. 5.0 for 5%), convert to decimal
-            # Most stocks don't have > 100% dividend yield.
-            if div_yield > 1.0:
+            # yfinance dividend yield format can be inconsistent (decimal vs percentage).
+            # Examples from the current portfolio:
+            # GNP.AX: 0.71  -> Intended as 0.71% (0.0071)
+            # ROYL.AX: 5.05 -> Intended as 5.05% (0.0505)
+            # Most stocks don't have > 20% yield. If it's > 0.2, it's almost certainly
+            # returned in percentage format (e.g., 5.0 for 5%) rather than decimal.
+            # Even for 0.71, it's more likely 0.71% (returned as 0.71) than 71% (returned as 0.71).
+            if div_yield > 0.0:
                 div_yield = div_yield / 100.0
 
-            data.append({'ticker': ticker, 'sector': sector, 'industry': industry, 'dividendYield': div_yield})
+            data.append({
+                'ticker': ticker,
+                'name': name,
+                'sector': sector,
+                'industry': industry,
+                'dividendYield': div_yield,
+                'marketCap': market_cap,
+                'eps_growth': eps_growth,
+                'forward_pe': forward_pe
+            })
         except Exception as e:
             print(f"Warning: Could not fetch info for {ticker}: {e}")
-            data.append({'ticker': ticker, 'sector': 'Unknown', 'industry': 'Unknown', 'dividendYield': 0.0})
+            data.append({
+                'ticker': ticker,
+                'name': ticker,
+                'sector': 'Others',
+                'industry': 'Others',
+                'dividendYield': 0.0,
+                'marketCap': 0.0,
+                'eps_growth': 0.0,
+                'forward_pe': 0.0
+            })
     
     return pd.DataFrame(data).set_index('ticker')
 
@@ -817,8 +842,8 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df, include_
     """
     # Merge risk contribution weights with sector/industry data
     analysis_df = risk_contrib[['Weight']].merge(sector_industry_df, left_index=True, right_index=True, how='left')
-    analysis_df['sector'] = analysis_df['sector'].fillna('Unknown')
-    analysis_df['industry'] = analysis_df['industry'].fillna('Unknown')
+    analysis_df['sector'] = analysis_df['sector'].fillna('Others')
+    analysis_df['industry'] = analysis_df['industry'].fillna('Others')
 
     # Calculate sector weights
     sector_weights = analysis_df.groupby('sector')['Weight'].sum().sort_values(ascending=False)
@@ -846,7 +871,7 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df, include_
         
         table_html += f"""
             <tr style="background-color: #eef7ff; font-weight: bold;">
-                <td>{sector}</td>
+                <td>{sector if sector != "Unknown" else "Others"}</td>
                 <td>{s_weight*100:.2f}%</td>
         """
         if include_yield:
@@ -860,7 +885,7 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df, include_
         for _, row in s_industries.iterrows():
             table_html += f"""
                 <tr>
-                    <td style="padding-left: 20px;">&bull; {row['industry']}</td>
+                    <td style="padding-left: 20px;">&bull; {row['industry'] if row['industry'] != "Unknown" else "Others"}</td>
                     <td>{row['Weight']*100:.2f}%</td>
             """
             if include_yield:
@@ -886,6 +911,97 @@ def generate_sector_industry_analysis(risk_contrib, sector_industry_df, include_
         'table_html': table_html,
         'pie_chart_html': pie_chart_html
     }
+
+
+def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price_data, portfolio_df):
+    """
+    Generates a table of portfolio holdings organized by defensive then active components,
+    sorted by weight from largest to lowest.
+    """
+    # Merge all data
+    holdings = risk_contrib[['Weight']].merge(sector_industry_df, left_index=True, right_index=True, how='left')
+    holdings = holdings.merge(portfolio_df[['ticker', 'type']].drop_duplicates().set_index('ticker'), left_index=True, right_index=True, how='left')
+    
+    # Calculate percentage growth since the start of the backtest
+    # price_data columns are tickers, index are dates
+    growth_pct = {}
+    for ticker in holdings.index:
+        if ticker in price_data.columns:
+            ticker_prices = price_data[ticker].dropna()
+            if not ticker_prices.empty:
+                start_price = ticker_prices.iloc[0]
+                end_price = ticker_prices.iloc[-1]
+                growth_pct[ticker] = (end_price / start_price - 1)
+            else:
+                growth_pct[ticker] = 0.0
+        else:
+            growth_pct[ticker] = 0.0
+    
+    holdings['growth_pct'] = pd.Series(growth_pct)
+    
+    # Organize by defensive then active, then by weight
+    # Map 'defensive' to 0 and 'active' to 1 for sorting
+    type_map = {'defensive': 0, 'active': 1}
+    holdings['type_sort'] = holdings['type'].map(type_map)
+    holdings = holdings.sort_values(['type_sort', 'Weight'], ascending=[True, False])
+    
+    # Generate HTML Table
+    table_html = """
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>Ticker</th>
+                <th>Name</th>
+                <th>Sector</th>
+                <th>Sub-sector/Industry</th>
+                <th>Weight (%)</th>
+                <th>Market Cap</th>
+                <th>Forward P/E</th>
+                <th>% Growth</th>
+                <th>Div Yield (%)</th>
+            </tr>
+        </thead>
+        <tbody>
+    """
+    
+    for ticker, row in holdings.iterrows():
+        # Format Market Cap
+        mc = row['marketCap']
+        if mc >= 1e12:
+            mc_str = f"{mc/1e12:.2f}T"
+        elif mc >= 1e9:
+            mc_str = f"{mc/1e9:.2f}B"
+        elif mc >= 1e6:
+            mc_str = f"{mc/1e6:.2f}M"
+        elif mc > 0:
+            mc_str = f"{mc:,.0f}"
+        else:
+            mc_str = "-"
+        
+        # Replace "Unknown" with "-"
+        sector = row['sector'] if row['sector'] != "Unknown" else "Others"
+        industry = row['industry'] if row['industry'] != "Unknown" else "Others"
+            
+        table_html += f"""
+            <tr>
+                <td style="font-weight: bold;">{row['type'].title()}</td>
+                <td>{ticker}</td>
+                <td>{row['name']}</td>
+                <td>{sector}</td>
+                <td>{industry}</td>
+                <td>{row['Weight']*100:.2f}%</td>
+                <td>{mc_str}</td>
+                <td>{f"{row['forward_pe']:.2f}" if row['forward_pe'] != 0 else "-"}</td>
+                <td style="color: {'green' if row['growth_pct'] > 0 else 'red' if row['growth_pct'] < 0 else 'black'}">
+                    {row['growth_pct']*100:+.2f}%
+                </td>
+                <td>{row['dividendYield']*100:.2f}%</td>
+            </tr>
+        """
+        
+    table_html += "</tbody></table>"
+    return table_html
 
 
 def generate_monte_carlo_chart(mc_simulations):
@@ -1053,7 +1169,7 @@ def generate_html_report(metrics, charts, report_title, inception_date, include_
 
 <h1>{{ report_title }}</h1>
 
-<h2>Portfolio Backtest (Since {{ inception_date }})</h2>
+<h2>Portfolio (Since {{ inception_date }})</h2>
 <div class="chart-container">
     {{ charts.value | safe }}
 </div>
@@ -1144,6 +1260,12 @@ def generate_html_report(metrics, charts, report_title, inception_date, include_
              {{ charts.sector_pie | safe }}
          </div>
      </div>
+</div>
+
+<div class="chart-container">
+     <h2>Portfolio Holdings Analysis</h2>
+     <p>Detailed breakdown of portfolio positions, organized by component type (Defensive vs. Active) and sorted by weighting.</p>
+     {{ charts.holdings_table | safe }}
 </div>
 
 <div class="chart-container">
@@ -1375,8 +1497,8 @@ def main():
         layer_yields = {"total": 0.0, "defensive": 0.0, "active": 0.0}
         benchmark_yield = 0.0
         # Zero out dividend yields in sector_industry_df to ensure they don't show up in analysis tables
-        if 'dividendYield' in sector_industry_df.columns:
-            sector_industry_df['dividendYield'] = 0.0
+        # Note: We keep them for the Holdings table even if not used in performance
+        pass
 
     # Calculate performance metrics for the benchmark itself
     benchmark_metrics = calculate_performance_metrics(benchmark, benchmark, benchmark_yield=benchmark_yield)
@@ -1455,6 +1577,11 @@ def main():
     sector_analysis = generate_sector_industry_analysis(risk, sector_industry_df, include_yield=include_yield)
     charts["sector_table"] = sector_analysis["table_html"]
     charts["sector_pie"] = sector_analysis["pie_chart_html"]
+
+    # Generate Portfolio Holdings Table
+    print("Generating portfolio holdings table...")
+    holdings_table_html = generate_portfolio_holdings_analysis(risk, sector_industry_df, prices, portfolio)
+    charts["holdings_table"] = holdings_table_html
 
     # Generate Monte Carlo simulation chart
     mc_chart_html = generate_monte_carlo_chart(mc_simulations)
