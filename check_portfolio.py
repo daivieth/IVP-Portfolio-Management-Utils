@@ -1325,7 +1325,7 @@ def generate_html_report(metrics, charts, report_title, inception_date, include_
     html = template.render(metrics=metrics, charts=charts, report_title=report_title, inception_date=formatted_date, include_yield=include_yield)
 
     # Write the generated HTML content to a file
-    with open("portfolio_report.html","w") as f:
+    with open("portfolio_report.html", "w", encoding="utf-8") as f:
         f.write(html)
 
     print("Report generated: portfolio_report.html")
