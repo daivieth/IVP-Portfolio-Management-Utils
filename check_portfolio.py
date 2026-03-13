@@ -922,23 +922,149 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
     holdings = risk_contrib[['Weight']].merge(sector_industry_df, left_index=True, right_index=True, how='left')
     holdings = holdings.merge(portfolio_df[['ticker', 'type']].drop_duplicates().set_index('ticker'), left_index=True, right_index=True, how='left')
     
-    # Calculate percentage growth since the start of the backtest
+    # Calculate percentage growth and momentum spread
     # price_data columns are tickers, index are dates
     growth_pct = {}
+    momentum_spreads = {}
+    momentum_signals = {}
+    reversal_risks = {}
+    rsis = {}
+    alerts = {}
+    perf_metrics = {}
+    
     for ticker in holdings.index:
         if ticker in price_data.columns:
             ticker_prices = price_data[ticker].dropna()
             if not ticker_prices.empty:
-                start_price = ticker_prices.iloc[0]
                 end_price = ticker_prices.iloc[-1]
-                growth_pct[ticker] = (end_price / start_price - 1)
+                
+                # Momentum Spread calculation (Price vs 200d SMA)
+                if len(ticker_prices) >= 200:
+                    sma200 = ticker_prices.rolling(window=200).mean().iloc[-1]
+                    spread = (end_price / sma200) - 1
+                elif len(ticker_prices) >= 20:
+                    # Fallback to shorter SMA if 200d not available
+                    sma_alt = ticker_prices.rolling(window=len(ticker_prices)).mean().iloc[-1]
+                    spread = (end_price / sma_alt) - 1
+                else:
+                    spread = 0.0
+                
+                momentum_spreads[ticker] = spread
+                
+                if spread > 0.02:
+                    momentum_signals[ticker] = "BULL"
+                elif spread < -0.02:
+                    momentum_signals[ticker] = "BEAR"
+                else:
+                    momentum_signals[ticker] = "NEUT"
+                
+                if len(ticker_prices) < 20:
+                    momentum_signals[ticker] = "N/A"
+                
+                # Performance metrics
+                p_current = ticker_prices.iloc[-1]
+                p_1w = ticker_prices.iloc[-min(len(ticker_prices), 6)] # 5 sessions ago
+                p_1m = ticker_prices.iloc[-min(len(ticker_prices), 22)] # 21 sessions ago
+                p_3m = ticker_prices.iloc[-min(len(ticker_prices), 64)] # 63 sessions ago
+                
+                ret_1w = (p_current / p_1w - 1)
+                ret_1m = (p_current / p_1m - 1)
+                ret_3m = (p_current / p_3m - 1)
+                perf_metrics[ticker] = {'1w': ret_1w, '1m': ret_1m, '3m': ret_3m}
+
+                # Short-term Reversal Risk calculation (RSI 14)
+                if len(ticker_prices) >= 15:
+                    delta = ticker_prices.diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    # Avoid division by zero
+                    rs = gain / loss.replace(0, np.nan)
+                    rsi_series = 100 - (100 / (1 + rs))
+                    rsi = rsi_series.iloc[-1]
+                    rsis[ticker] = rsi
+                    
+                    if rsi > 70:
+                        reversal_risks[ticker] = "OVERBOUGHT"
+                    elif rsi < 30:
+                        reversal_risks[ticker] = "OVERSOLD"
+                    else:
+                        reversal_risks[ticker] = "STABLE"
+                else:
+                    rsis[ticker] = 50.0
+                    reversal_risks[ticker] = "N/A"
             else:
-                growth_pct[ticker] = 0.0
+                momentum_spreads[ticker] = 0.0
+                momentum_signals[ticker] = "N/A"
+                rsis[ticker] = 50.0
+                reversal_risks[ticker] = "N/A"
+                perf_metrics[ticker] = {'1w': 0, '1m': 0, '3m': 0}
         else:
-            growth_pct[ticker] = 0.0
+            momentum_spreads[ticker] = 0.0
+            momentum_signals[ticker] = "N/A"
+            rsis[ticker] = 50.0
+            reversal_risks[ticker] = "N/A"
+            perf_metrics[ticker] = {'1w': 0, '1m': 0, '3m': 0}
     
-    holdings['growth_pct'] = pd.Series(growth_pct)
+    holdings['momentum_spread'] = pd.Series(momentum_spreads)
+    holdings['momentum_signal'] = pd.Series(momentum_signals)
+    holdings['reversal_risk'] = pd.Series(reversal_risks)
+    holdings['rsi'] = pd.Series(rsis)
+    holdings['ret_1w'] = pd.Series({k: v['1w'] for k, v in perf_metrics.items()})
+    holdings['ret_1m'] = pd.Series({k: v['1m'] for k, v in perf_metrics.items()})
+    holdings['ret_3m'] = pd.Series({k: v['3m'] for k, v in perf_metrics.items()})
     
+    # Calculate Trend Acceleration (1W vs 1M trend)
+    accel_list = []
+    for ticker, row in holdings.iterrows():
+        # Average weekly return based on 1M performance
+        avg_w_1m = row['ret_1m'] / 4.2
+        diff = row['ret_1w'] - avg_w_1m
+        
+        if diff > 0.02:
+            accel_list.append("ACCEL")
+        elif diff < -0.02:
+            accel_list.append("DECEL")
+        else:
+            accel_list.append("FLAT")
+    holdings['trend_accel'] = accel_list
+    
+    # Calculate industry average Forward P/E for comparison
+    valid_pes = holdings[holdings['forward_pe'] > 0]
+    if not valid_pes.empty:
+        industry_avg_pes = valid_pes.groupby('industry')['forward_pe'].mean()
+        holdings['industry_avg_pe'] = holdings['industry'].map(industry_avg_pes)
+    else:
+        holdings['industry_avg_pe'] = 0.0
+
+    # Calculate Alerts
+    alert_list = []
+    alert_colors = []
+    for ticker, row in holdings.iterrows():
+        pe_ratio = (row['forward_pe'] / row['industry_avg_pe']) if row['industry_avg_pe'] > 0 else 1.0
+        rsi = row['rsi']
+        mom = row['momentum_signal']
+        r1w = row['ret_1w']
+        r1m = row['ret_1m']
+        
+        if mom == "BULL" and rsi < 48 and pe_ratio < 1.05:
+            alert = "TOP UP"
+            color = "#008800"
+        elif (mom == "BULL" and rsi > 78) or (mom == "BEAR" and pe_ratio > 1.25):
+            alert = "REDUCE"
+            color = "#cc0000"
+        elif r1w < -0.08 or rsi > 82 or (mom == "BEAR" and r1m < -0.15):
+            alert = "ATTENTION"
+            color = "#ff8800"
+        else:
+            alert = "HOLD"
+            color = "#666666"
+        
+        alert_list.append(alert)
+        alert_colors.append(color)
+    
+    holdings['alert'] = alert_list
+    holdings['alert_color'] = alert_colors
+
     # Organize by defensive then active, then by weight
     # Map 'defensive' to 0 and 'active' to 1 for sorting
     type_map = {'defensive': 0, 'active': 1}
@@ -957,9 +1083,12 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
                 <th>Sub-sector/Industry</th>
                 <th>Weight (%)</th>
                 <th>Market Cap</th>
-                <th>Forward P/E</th>
-                <th>% Growth</th>
                 <th>Div Yield (%)</th>
+                <th>Forward P/E</th>
+                <th>Momentum Spread</th>
+                <th>ST Reversal Risk</th>
+                <th>Trend Accel.</th>
+                <th>Action Alert</th>
             </tr>
         </thead>
         <tbody>
@@ -983,6 +1112,11 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
         sector = row['sector'] if row['sector'] != "Unknown" else "Others"
         industry = row['industry'] if row['industry'] != "Unknown" else "Others"
             
+        # Bloomberg style momentum signal
+        ms = row['momentum_signal']
+        bg_color = "#008800" if ms == "BULL" else "#cc0000" if ms == "BEAR" else "#666666" if ms == "NEUT" else "transparent"
+        text_color = "white" if ms in ["BULL", "BEAR", "NEUT"] else "black"
+        
         table_html += f"""
             <tr>
                 <td style="font-weight: bold;">{row['type'].title()}</td>
@@ -992,11 +1126,58 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
                 <td>{industry}</td>
                 <td>{row['Weight']*100:.2f}%</td>
                 <td>{mc_str}</td>
-                <td>{f"{row['forward_pe']:.2f}" if row['forward_pe'] != 0 else "-"}</td>
-                <td style="color: {'green' if row['growth_pct'] > 0 else 'red' if row['growth_pct'] < 0 else 'black'}">
-                    {row['growth_pct']*100:+.2f}%
-                </td>
                 <td>{row['dividendYield']*100:.2f}%</td>
+                <td>
+                    {f"""
+                        <div style="font-weight: bold; font-family: 'Courier New', monospace; font-size: 1.1em; color: #333;">
+                            {row['forward_pe']:.2f}
+                        </div>
+                    """ if row['forward_pe'] > 0 else "-"}
+                    
+                    {f"""
+                        <div style="font-size: 0.75em; font-weight: bold; color: {'#cc0000' if (row['forward_pe'] / row['industry_avg_pe'] - 1) > 0.05 else '#008800' if (row['forward_pe'] / row['industry_avg_pe'] - 1) < -0.05 else '#666'};">
+                            {'&#9650;' if (row['forward_pe'] / row['industry_avg_pe'] - 1) > 0.05 else '&#9660;' if (row['forward_pe'] / row['industry_avg_pe'] - 1) < -0.05 else '&#8226;'}
+                            {abs(row['forward_pe'] / row['industry_avg_pe'] - 1) * 100:.1f}% vs Ind.
+                        </div>
+                    """ if row['forward_pe'] > 0 and row['industry_avg_pe'] > 0 else ""}
+                </td>
+                <td style="text-align: center; vertical-align: middle;">
+                    <div style="background-color: {bg_color}; color: {text_color}; padding: 4px 8px; border-radius: 2px; font-weight: bold; font-family: 'Courier New', monospace; font-size: 0.9em; display: inline-block; min-width: 50px;">
+                        {ms}
+                    </div>
+                    <div style="font-size: 0.8em; margin-top: 2px; color: {'#008800' if row['momentum_spread'] > 0 else '#cc0000' if row['momentum_spread'] < 0 else '#666'}">
+                        {row['momentum_spread']*100:+.2f}%
+                    </div>
+                </td>
+                <td style="text-align: center; vertical-align: middle;">
+                    {f"""
+                        <div style="background-color: {'#cc0000' if row['reversal_risk'] == 'OVERBOUGHT' else '#008800' if row['reversal_risk'] == 'OVERSOLD' else '#666666'}; color: white; padding: 4px 8px; border-radius: 2px; font-weight: bold; font-family: 'Courier New', monospace; font-size: 0.85em; display: inline-block; min-width: 80px;">
+                            {row['reversal_risk']}
+                        </div>
+                        <div style="font-size: 0.75em; margin-top: 2px; color: #555;">
+                            RSI: {row['rsi']:.1f}
+                        </div>
+                    """ if row['reversal_risk'] != "N/A" else "-"}
+                </td>
+                <td style="text-align: center; vertical-align: middle;">
+                    {f"""
+                        <div style="font-weight: bold; font-family: 'Courier New', monospace; font-size: 1.2em; color: {'#008800' if row['trend_accel'] == 'ACCEL' else '#cc0000' if row['trend_accel'] == 'DECEL' else '#666'};">
+                            {'&#187;&#187;&#187;' if row['trend_accel'] == 'ACCEL' else '&#171;&#171;&#171;' if row['trend_accel'] == 'DECEL' else '---'}
+                        </div>
+                        <div style="font-size: 0.7em; color: #777; margin-top: 2px;">
+                            {row['trend_accel']}
+                        </div>
+                    """}
+                </td>
+                <td style="text-align: center; vertical-align: middle;">
+                    <div style="background-color: {row['alert_color']}; color: white; padding: 6px 10px; border-radius: 4px; font-weight: bold; font-family: 'Courier New', monospace; font-size: 0.9em; box-shadow: 1px 1px 2px rgba(0,0,0,0.2);">
+                        {row['alert']}
+                    </div>
+                    <div style="font-size: 0.7em; margin-top: 4px; color: #777; line-height: 1.1;">
+                        1W: {row['ret_1w']*100:+.1f}%<br/>
+                        1M: {row['ret_1m']*100:+.1f}%
+                    </div>
+                </td>
             </tr>
         """
         
@@ -1088,6 +1269,7 @@ def generate_html_report(metrics, charts, report_title, inception_date, include_
 <html>
 
 <head>
+<meta charset="UTF-8">
 <style>
     body {
         font-family: Arial, sans-serif;
