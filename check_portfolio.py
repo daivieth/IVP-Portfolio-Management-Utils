@@ -1015,10 +1015,12 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
     
     # Calculate Trend Acceleration (1W vs 1M trend)
     accel_list = []
+    accel_scores = []
     for ticker, row in holdings.iterrows():
         # Average weekly return based on 1M performance
         avg_w_1m = row['ret_1m'] / 4.2
         diff = row['ret_1w'] - avg_w_1m
+        score = diff * 100 # In percentage points
         
         if diff > 0.02:
             accel_list.append("ACCEL")
@@ -1026,7 +1028,9 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
             accel_list.append("DECEL")
         else:
             accel_list.append("FLAT")
+        accel_scores.append(score)
     holdings['trend_accel'] = accel_list
+    holdings['accel_score'] = accel_scores
     
     # Calculate industry average Forward P/E for comparison
     valid_pes = holdings[holdings['forward_pe'] > 0]
@@ -1036,28 +1040,40 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
     else:
         holdings['industry_avg_pe'] = 0.0
 
-    # Calculate Alerts
+    # Calculate Alerts with Multi-Factor Scoring
     alert_list = []
     alert_colors = []
     for ticker, row in holdings.iterrows():
-        pe_ratio = (row['forward_pe'] / row['industry_avg_pe']) if row['industry_avg_pe'] > 0 else 1.0
-        rsi = row['rsi']
-        mom = row['momentum_signal']
-        r1w = row['ret_1w']
-        r1m = row['ret_1m']
+        # 1. Valuation Score (vs Industry)
+        pe_diff = (row['forward_pe'] / row['industry_avg_pe'] - 1) if row['industry_avg_pe'] > 0 else 0
+        v_score = 2 if pe_diff < -0.15 else 1 if pe_diff < -0.05 else -2 if pe_diff > 0.25 else -1 if pe_diff > 0.10 else 0
         
-        if mom == "BULL" and rsi < 48 and pe_ratio < 1.05:
-            alert = "TOP UP"
-            color = "#008800"
-        elif (mom == "BULL" and rsi > 78) or (mom == "BEAR" and pe_ratio > 1.25):
-            alert = "REDUCE"
-            color = "#cc0000"
-        elif r1w < -0.08 or rsi > 82 or (mom == "BEAR" and r1m < -0.15):
-            alert = "ATTENTION"
-            color = "#ff8800"
+        # 2. Momentum Score (Long-term)
+        m_score = 2 if row['momentum_signal'] == "BULL" else -2
+        
+        # 3. Reversal Score (Short-term Exhaustion)
+        rsi = row['rsi']
+        r_score = 1 if rsi < 35 else -2 if rsi > 75 else 0
+        
+        # 4. Velocity Score (Trend Accel)
+        vel = row['accel_score']
+        vel_score = 1 if vel > 8 else -1 if vel < -8 else 0
+        
+        # 5. Performance Profile
+        r1w, r1m, r3m = row['ret_1w'], row['ret_1m'], row['ret_3m']
+        p_score = 1 if (r1w > 0 and r1m > 0 and r3m > 0) else -1 if r1w < -0.07 else 0
+        
+        total_score = v_score + m_score + r_score + vel_score + p_score
+        
+        # Determine Final Alert
+        if r1w < -0.10 or rsi > 85: # Immediate Warning Flags
+            alert, color = "ATTENTION", "#ff8800"
+        elif total_score >= 4:
+            alert, color = "TOP UP", "#008800"
+        elif total_score <= -2:
+            alert, color = "RISKY", "#cc0000"
         else:
-            alert = "HOLD"
-            color = "#666666"
+            alert, color = "HOLD", "transparent"
         
         alert_list.append(alert)
         alert_colors.append(color)
@@ -1073,7 +1089,34 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
     
     # Generate HTML Table
     table_html = """
-    <table>
+    <script>
+    function exportTableToCSV(tableID, filename) {
+        var table = document.getElementById(tableID);
+        if (!table) return;
+        var csv = [];
+        var rows = table.querySelectorAll("tr");
+        for (var i = 0; i < rows.length; i++) {
+            var row = [], cols = rows[i].querySelectorAll("td, th");
+            for (var j = 0; j < cols.length; j++) {
+                var data = cols[j].innerText.replace(/(\\r\\n|\\n|\\r)/gm, " ").replace(/"/g, '""');
+                row.push('"' + data.trim() + '"');
+            }
+            csv.push(row.join(","));
+        }
+        var csvContent = String.fromCharCode(65279) + csv.join("\\n");
+        var blob = new Blob([csvContent], {type: "text/csv;charset=utf-8;"});
+        var link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename + ".csv";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+    </script>
+    <button onclick="exportTableToCSV('holdings-table', 'portfolio_holdings_analysis')" style="background-color: #2c3e50; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-weight: bold; margin-bottom: 15px; display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 1.2em;">&#128196;</span> Export to Excel (CSV)
+    </button>
+    <table id="holdings-table">
         <thead>
             <tr>
                 <th>Component</th>
@@ -1087,7 +1130,8 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
                 <th>Forward P/E</th>
                 <th>Momentum Spread</th>
                 <th>ST Reversal Risk</th>
-                <th>Trend Accel.</th>
+                <th title="Trend Acceleration: Difference between 1-Week return and average weekly return over the last month. Higher positive = Speeding up.">Trend Velocity</th>
+                <th>Perf (3M, 1M, 1W)</th>
                 <th>Action Alert</th>
             </tr>
         </thead>
@@ -1159,24 +1203,69 @@ def generate_portfolio_holdings_analysis(risk_contrib, sector_industry_df, price
                         </div>
                     """ if row['reversal_risk'] != "N/A" else "-"}
                 </td>
-                <td style="text-align: center; vertical-align: middle;">
+                <td style="text-align: center; vertical-align: middle; min-width: 110px;" title="Difference from monthly trend (percentage points)">
                     {f"""
-                        <div style="font-weight: bold; font-family: 'Courier New', monospace; font-size: 1.2em; color: {'#008800' if row['trend_accel'] == 'ACCEL' else '#cc0000' if row['trend_accel'] == 'DECEL' else '#666'};">
-                            {'&#187;&#187;&#187;' if row['trend_accel'] == 'ACCEL' else '&#171;&#171;&#171;' if row['trend_accel'] == 'DECEL' else '---'}
-                        </div>
-                        <div style="font-size: 0.7em; color: #777; margin-top: 2px;">
-                            {row['trend_accel']}
+                        <div style="display: flex; align-items: center; justify-content: center; gap: 6px;">
+                            <div style="display: flex; gap: 2px;">
+                                {"".join([
+                                    f'<div style="width: 5px; height: 16px; border-radius: 1px; background-color: {"#00aa00" if row["accel_score"] > 0 else "#cc0000" if row["accel_score"] < 0 else "#bbb"}; opacity: {"1.0" if i < (5 if abs(row["accel_score"]) > 10 else 4 if abs(row["accel_score"]) > 7 else 3 if abs(row["accel_score"]) > 4 else 2 if abs(row["accel_score"]) > 1 else 1) else "0.2"};"></div>'
+                                    for i in range(5)
+                                ])}
+                            </div>
+                            <div style="min-width: 45px; text-align: left;">
+                                <span style="color: {"#00aa00" if row["accel_score"] > 0 else "#cc0000" if row["accel_score"] < 0 else "#666"}; font-weight: bold; font-family: 'Courier New', monospace; font-size: 1.0em;">
+                                    {('+' if row['accel_score'] > 0 else '-' if row['accel_score'] < 0 else '')}{abs(row['accel_score']):.0f}<span style="font-size: 0.7em; font-weight: normal; margin-left: 1px;">pts</span>
+                                </span>
+                            </div>
                         </div>
                     """}
                 </td>
                 <td style="text-align: center; vertical-align: middle;">
-                    <div style="background-color: {row['alert_color']}; color: white; padding: 6px 10px; border-radius: 4px; font-weight: bold; font-family: 'Courier New', monospace; font-size: 0.9em; box-shadow: 1px 1px 2px rgba(0,0,0,0.2);">
-                        {row['alert']}
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 4px; height: 55px; padding: 2px;">
+                        {f"""
+                            <div style="display: flex; flex-direction: column; align-items: center; width: 18px;" title="3M Performance: {row['ret_3m']*100:+.1f}%">
+                                <div style="height: 20px; display: flex; align-items: flex-end;">
+                                    {f'<div style="height: {min(20, max(1, int(row["ret_3m"]*100)))}px; width: 10px; background: #00aa00; border-radius: 1px 1px 0 0;"></div>' if row['ret_3m'] > 0 else ""}
+                                </div>
+                                <div style="height: 1px; width: 100%; background: #ccc;"></div>
+                                <div style="height: 20px; display: flex; align-items: flex-start;">
+                                    {f'<div style="height: {min(20, max(1, int(abs(row["ret_3m"])*100)))}px; width: 10px; background: #cc0000; border-radius: 0 0 1px 1px;"></div>' if row['ret_3m'] < 0 else ""}
+                                </div>
+                                <div style="font-size: 0.55em; color: #999; margin-top: 1px;">3M</div>
+                            </div>
+                            <div style="display: flex; flex-direction: column; align-items: center; width: 18px;" title="1M Performance: {row['ret_1m']*100:+.1f}%">
+                                <div style="height: 20px; display: flex; align-items: flex-end;">
+                                    {f'<div style="height: {min(20, max(1, int(row["ret_1m"]*100)))}px; width: 10px; background: #00aa00; border-radius: 1px 1px 0 0;"></div>' if row['ret_1m'] > 0 else ""}
+                                </div>
+                                <div style="height: 1px; width: 100%; background: #ccc;"></div>
+                                <div style="height: 20px; display: flex; align-items: flex-start;">
+                                    {f'<div style="height: {min(20, max(1, int(abs(row["ret_1m"])*100)))}px; width: 10px; background: #cc0000; border-radius: 0 0 1px 1px;"></div>' if row['ret_1m'] < 0 else ""}
+                                </div>
+                                <div style="font-size: 0.55em; color: #999; margin-top: 1px;">1M</div>
+                            </div>
+                            <div style="display: flex; flex-direction: column; align-items: center; width: 18px;" title="1W Performance: {row['ret_1w']*100:+.1f}%">
+                                <div style="height: 20px; display: flex; align-items: flex-end;">
+                                    {f'<div style="height: {min(20, max(1, int(row["ret_1w"]*100)))}px; width: 10px; background: #00aa00; border-radius: 1px 1px 0 0;"></div>' if row['ret_1w'] > 0 else ""}
+                                </div>
+                                <div style="height: 1px; width: 100%; background: #ccc;"></div>
+                                <div style="height: 20px; display: flex; align-items: flex-start;">
+                                    {f'<div style="height: {min(20, max(1, int(abs(row["ret_1w"])*100)))}px; width: 10px; background: #cc0000; border-radius: 0 0 1px 1px;"></div>' if row['ret_1w'] < 0 else ""}
+                                </div>
+                                <div style="font-size: 0.55em; color: #999; margin-top: 1px;">1W</div>
+                            </div>
+                        """}
                     </div>
-                    <div style="font-size: 0.7em; margin-top: 4px; color: #777; line-height: 1.1;">
-                        1W: {row['ret_1w']*100:+.1f}%<br/>
-                        1M: {row['ret_1m']*100:+.1f}%
-                    </div>
+                </td>
+                <td style="text-align: center; vertical-align: middle;">
+                    {f"""
+                        <div style="background-color: {row['alert_color']}; color: white; padding: 6px 10px; border-radius: 4px; font-weight: bold; font-family: 'Courier New', monospace; font-size: 0.9em; box-shadow: 1px 1px 2px rgba(0,0,0,0.2);">
+                            {row['alert']}
+                        </div>
+                        <div style="font-size: 0.7em; margin-top: 4px; color: #777; line-height: 1.1;">
+                            1W: {row['ret_1w']*100:+.1f}%<br/>
+                            1M: {row['ret_1m']*100:+.1f}%
+                        </div>
+                    """ if row['alert'] != "HOLD" else ""}
                 </td>
             </tr>
         """
